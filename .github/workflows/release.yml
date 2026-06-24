@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, ext: "", musl: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="foldlock-${{ matrix.target }}"
+          bin="target/${{ matrix.target }}/release/foldlock${{ matrix.ext }}"
+          mkdir -p dist
+          cp "$bin" "dist/${name}${{ matrix.ext }}"
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${name}${{ matrix.ext }}" > "${name}.sha256"
+          else
+            shasum -a 256 "${name}${{ matrix.ext }}" > "${name}.sha256"
+          fi
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/foldlock-*

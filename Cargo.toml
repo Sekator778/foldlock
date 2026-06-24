@@ -1,0 +1,55 @@
+[package]
+name = "foldlock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Tiny CLI that compresses a folder, encrypts it with a password, and splits it into fixed-size volumes."
+authors = ["Sekator778"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Sekator778/foldlock"
+homepage = "https://github.com/Sekator778/foldlock"
+keywords = ["compression", "encryption", "archive", "split", "backup"]
+categories = ["command-line-utilities", "compression", "cryptography"]
+exclude = ["/.github", "/tests"]
+
+[[bin]]
+name = "foldlock"
+path = "src/main.rs"
+
+[lib]
+name = "foldlock"
+path = "src/lib.rs"
+
+[dependencies]
+# Archive (pure Rust)
+tar = "0.4"
+# Compression (libzstd built via cc) — excellent ratio at level 19.
+# `zstdmt` builds libzstd with multi-threaded compression support.
+zstd = { version = "0.13", features = ["zstdmt"] }
+# Authenticated encryption: ChaCha20-Poly1305 in STREAM mode (RustCrypto)
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+# Password-based key derivation (raw KDF only; no PHC string deps).
+# `zeroize` wipes Argon2's internal memory blocks after hashing.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# Wipe the derived key from memory on drop.
+zeroize = "1"
+# OS CSPRNG for salt + nonce prefix
+getrandom = "0.2"
+# Directory traversal
+walkdir = "2"
+# Hidden password prompt fallback
+rpassword = "7"
+# Ergonomic error handling
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Small, fast binary: aggressive size optimization for releases.
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true          # link-time optimization across crates
+codegen-units = 1   # better optimization, slower compile
+panic = "abort"     # drop unwinding machinery
+strip = true        # strip symbols from the binary
