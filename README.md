@@ -114,6 +114,58 @@ When a password is passed as an argument, foldlock prints a one-line warning to 
 foldlock compress ./photos -- -my-password 100
 ```
 
+### Examples
+
+**Back up a photo library into 100 MiB volumes** (fits on FAT32 / upload chunks):
+
+```sh
+foldlock compress ./photos - 100
+# → photos.flk.001, photos.flk.002, …  (prompts for the password, no echo)
+```
+
+**Maximum density for a source tree** (xz, ~9% smaller than the default):
+
+```sh
+foldlock compress ./project - 500 --max
+# Created N volume(s) … (xz, 1 thread(s))
+```
+
+**Single-file archive** (huge volume size ⇒ everything in `.001`):
+
+```sh
+foldlock compress ./project s3cret 1000000    # 1 TB cap → one volume
+```
+
+**Non-interactive backup from a script / cron** (password from the environment):
+
+```sh
+export FOLDLOCK_PASSWORD='correct horse battery staple'
+foldlock compress /var/data/db - 250 --max
+unset FOLDLOCK_PASSWORD
+```
+
+**zstd ultra when you want more density but keep zstd’s fast decompression:**
+
+```sh
+foldlock compress ./logs s3cret 100 -l 22
+```
+
+**Restore** — no size or algorithm needed, both are read from the archive:
+
+```sh
+foldlock decompress ./photos.flk -             # base name, prompt for password
+foldlock decompress ./photos.flk.001 -         # …or point at any single volume
+foldlock decompress ./photos.flk s3cret -f     # overwrite an existing ./photos
+```
+
+**Full round trip in one place:**
+
+```sh
+foldlock compress ./notes - 50 --max     # → notes.flk.001, …
+rm -rf ./notes                            # (originals gone)
+foldlock decompress ./notes.flk -         # → recreates ./notes, byte-identical
+```
+
 ## 🧠 How it works
 
 ```text
