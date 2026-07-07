@@ -24,7 +24,7 @@ Extracted './photos' from 11 volume(s).
 
 - **One command does it all** — archive + compress + encrypt + split (and the exact reverse).
 - **Strong, authenticated encryption** — ChaCha20-Poly1305 in AEAD **STREAM** mode, keyed by **Argon2id** from your password. Tampering, truncation, reordering, and wrong passwords are all detected.
-- **Excellent compression** — zstd at level 19.
+- **Excellent compression** — zstd at level 19 by default, with optional zstd-ultra (`-l 22`) or xz/LZMA (`--max`) for maximum density.
 - **Uses every CPU core** — multi-threaded compression (the only CPU-bound stage) scales across all cores automatically.
 - **Splits into volumes** — choose any volume size in MiB; great for size-limited storage, uploads, or transfer.
 - **Tiny & self-contained** — a single ~1 MB binary, no runtime dependencies, optimized for size.
@@ -72,6 +72,24 @@ foldlock compress ./photos s3cret 100   # 100 MiB volumes: photos.flk.001, .002,
 
 Volumes are written to the current directory as `<folder>.flk.001`, `.002`, …
 
+#### Compression backend & level
+
+By default foldlock uses **zstd level 19** — fast and a great ratio. For maximum density you can switch backends or raise the level:
+
+```sh
+foldlock compress ./src s3cret 100 --max        # xz / LZMA: ~9% smaller, ~3x slower
+foldlock compress ./src s3cret 100 -l 22        # zstd ultra (wider window)
+foldlock compress ./src s3cret 100 --algo xz -l 6   # xz, custom level
+```
+
+- `-a, --algo <zstd|xz>` – backend (default `zstd`). `xz` is ~9% smaller on source
+  trees but ~3× slower; decompression speed is unaffected.
+- `-l, --level <n>` – level. zstd: `1..=22` (default 19; `20..=22` enable a wider
+  window for higher density). xz: `0..=9` (default 9, extreme).
+- `--max` – shortcut for `--algo xz`.
+
+The backend is recorded in the archive header, so **decompression detects it automatically** — no flag needed.
+
 ### Decompress
 
 ```sh
@@ -99,8 +117,8 @@ foldlock compress ./photos -- -my-password 100
 ## 🧠 How it works
 
 ```text
-compress:   folder ─▶ tar ─▶ zstd (level 19, multi-threaded) ─▶ ChaCha20-Poly1305 STREAM ─▶ split into .NNN volumes
-decompress: .NNN volumes ─▶ join ─▶ decrypt + verify ─▶ unzstd ─▶ untar ─▶ folder
+compress:   folder ─▶ tar ─▶ compress (zstd or xz) ─▶ ChaCha20-Poly1305 STREAM ─▶ split into .NNN volumes
+decompress: .NNN volumes ─▶ join ─▶ decrypt + verify ─▶ decompress ─▶ untar ─▶ folder
 ```
 
 Each archive begins with a small plaintext header (magic, version, a random 16-byte salt, a random 7-byte nonce prefix, and the folder name). The header is fed as **additional authenticated data** to the first encryption block, so any tampering with it is detected.
@@ -115,7 +133,7 @@ The compressed byte stream is encrypted as a sequence of 64 KiB AEAD blocks (the
 | Encryption | ChaCha20-Poly1305 (AEAD), STREAM/`BE32` construction |
 | Per-block nonce | random 7-byte prefix ‖ 32-bit counter |
 | Integrity | Poly1305 tag per block; header bound as AAD |
-| Compression | zstd, level 19, multi-threaded |
+| Compression | zstd level 19 (default, multi-threaded); optional zstd-ultra or xz/LZMA |
 
 ## ⚠️ Security notes & limitations
 
