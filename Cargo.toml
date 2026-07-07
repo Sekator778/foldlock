@@ -27,6 +27,9 @@ tar = "0.4"
 # Compression (libzstd built via cc) — excellent ratio at level 19.
 # `zstdmt` builds libzstd with multi-threaded compression support.
 zstd = { version = "0.13", features = ["zstdmt"] }
+# Optional maximum-density backend: LZMA/xz (liblzma built via cc, like zstd).
+# ~9% smaller than zstd-19 on source trees, at ~3x the compression time.
+xz2 = "0.1"
 # Authenticated encryption: ChaCha20-Poly1305 in STREAM mode (RustCrypto)
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
 # Password-based key derivation (raw KDF only; no PHC string deps).
