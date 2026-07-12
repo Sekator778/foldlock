@@ -618,6 +618,57 @@ fn armor_corruption_is_rejected() {
     assert!(err.is_err(), "corrupted armored text must be rejected");
 }
 
+/// The headline case: the armored blob is pasted into the middle of an ordinary
+/// message — greeting and signature around it, and the blob itself reflowed
+/// across CRLF lines — yet foldlock finds and extracts it.
+#[test]
+fn armor_found_buried_in_an_email() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("notes");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: u64::MAX,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
+        armor: true,
+    })
+    .expect("armor compress failed");
+
+    let blob = fs::read_to_string(out_dir.join("notes.flk.txt")).unwrap();
+    // Wrap the blob across CRLF lines (breaks even fall inside the frame tokens).
+    let wrapped = blob
+        .as_bytes()
+        .chunks(48)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    // Bury it in a message with prose (full of base64-alphabet letters) around it.
+    let message = format!(
+        "Hi Bob,\r\n\r\nHere is the backup you asked for — paste the block below\r\n\
+         into foldlock to unpack it:\r\n\r\n{wrapped}\r\n\r\nThanks a lot!\r\nAlice\r\n"
+    );
+    let pasted = work.path().join("email.txt");
+    fs::write(&pasted, message).unwrap();
+
+    let extract_dir = work.path().join("extract");
+    let result = decompress(&DecompressOptions {
+        archive: pasted,
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("payload must be found inside surrounding prose");
+
+    assert_eq!(result.source, SourceKind::Armor);
+    assert_tree_matches(&extract_dir.join("notes"), &expected);
+}
+
 /// A plain text file that is not an archive must not be mistaken for armor; it
 /// falls through to the binary path and fails cleanly.
 #[test]
