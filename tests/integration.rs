@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use foldlock::{compress, decompress, Algorithm, CompressOptions, DecompressOptions};
+use foldlock::{compress, decompress, Algorithm, CompressOptions, DecompressOptions, SourceKind};
 use tempfile::tempdir;
 
 /// Deterministic, incompressible-ish bytes (so the compressed stream is large
@@ -89,6 +89,7 @@ fn roundtrip_tiny_volumes_force_midblock_splits() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .expect("compress failed");
 
@@ -129,6 +130,7 @@ fn roundtrip_single_large_volume() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -160,6 +162,7 @@ fn wrong_password_is_rejected() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -188,6 +191,7 @@ fn refuses_to_overwrite_without_force() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -236,6 +240,7 @@ fn skips_own_output_volumes_when_packing_in_place() {
         output_dir: source.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -271,6 +276,7 @@ fn force_replaces_stale_files() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -318,6 +324,7 @@ fn failed_force_preserves_existing_folder() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
 
@@ -364,6 +371,7 @@ fn empty_password_is_rejected() {
         output_dir: work.path().join("out"),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     });
     assert!(err.is_err(), "empty password must be rejected");
 }
@@ -383,6 +391,7 @@ fn missing_interior_volume_is_detected() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: None,
+        armor: false,
     })
     .unwrap();
     assert!(summary.volumes.len() >= 3);
@@ -419,6 +428,7 @@ fn roundtrip_xz_backend() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Xz,
         level: None,
+        armor: false,
     })
     .expect("xz compress failed");
     assert!(summary.volumes.len() > 1, "expected several volumes");
@@ -453,6 +463,7 @@ fn roundtrip_zstd_ultra_level() {
         output_dir: out_dir.clone(),
         algorithm: Algorithm::Zstd,
         level: Some(22),
+        armor: false,
     })
     .expect("zstd ultra compress failed");
 
@@ -466,4 +477,214 @@ fn roundtrip_zstd_ultra_level() {
     .expect("zstd ultra decompress failed");
 
     assert_tree_matches(&extract_dir.join("payload"), &expected);
+}
+
+/// Compress with `--armor`, then decompress by pointing at the text file — the
+/// kind must be detected from its content, with no size or algorithm argument.
+#[test]
+fn roundtrip_armor_autodetected() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("notes");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    let summary = compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: u64::MAX, // ignored under armor
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
+        armor: true,
+    })
+    .expect("armor compress failed");
+
+    assert!(summary.armored, "summary should report an armored output");
+    assert_eq!(summary.volumes.len(), 1, "armor writes exactly one file");
+    let armored = summary.volumes[0].clone();
+    assert_eq!(armored.extension().and_then(|e| e.to_str()), Some("txt"));
+
+    // The file must be an opaque run of base64 characters: no markers, no
+    // envelope, nothing readable — only the alphabet (and it is a single line).
+    let text = fs::read(&armored).unwrap();
+    assert!(!text.is_empty());
+    assert!(
+        text.iter()
+            .all(|&b| { b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=' }),
+        "armored file must contain only base64 characters (no markers)"
+    );
+    assert!(
+        !text.contains(&b'\n'),
+        "armored output must be a single line"
+    );
+
+    let extract_dir = work.path().join("extract");
+    let result = decompress(&DecompressOptions {
+        archive: armored,
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("armor decompress failed");
+
+    assert_eq!(result.source, SourceKind::Armor);
+    assert_tree_matches(&extract_dir.join("notes"), &expected);
+}
+
+/// A messy clipboard round-trip — a BOM, CRLF endings, injected blank lines and
+/// spaces, and a completely different file name — must still decode and extract.
+#[test]
+fn armor_survives_a_messy_paste() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("notes");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: u64::MAX,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
+        armor: true,
+    })
+    .expect("armor compress failed");
+
+    let clean = fs::read(out_dir.join("notes.flk.txt")).unwrap();
+    // Reflow it the way an editor might after a paste: a BOM, then wrapped lines
+    // with CRLF endings and some stray indentation.
+    let mut messy = vec![0xEF, 0xBB, 0xBF];
+    for (i, &b) in clean.iter().enumerate() {
+        messy.push(b);
+        if i % 40 == 39 {
+            messy.extend_from_slice(b"\r\n   ");
+        }
+    }
+    messy.extend_from_slice(b"\r\n");
+    // Save under an arbitrary name the user might have chosen (e.g. "one").
+    let pasted = work.path().join("one");
+    fs::write(&pasted, &messy).unwrap();
+
+    let extract_dir = work.path().join("extract");
+    let result = decompress(&DecompressOptions {
+        archive: pasted,
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("messy armored paste should still decompress");
+
+    assert_eq!(result.source, SourceKind::Armor);
+    assert_tree_matches(&extract_dir.join("notes"), &expected);
+}
+
+/// A single altered character in the armored body must be caught by the AEAD
+/// (there is no separate checksum) rather than yielding corrupt output.
+#[test]
+fn armor_corruption_is_rejected() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("notes");
+    fs::create_dir_all(&source).unwrap();
+    build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: u64::MAX,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
+        armor: true,
+    })
+    .expect("armor compress failed");
+
+    let mut text = fs::read(out_dir.join("notes.flk.txt")).unwrap();
+    // Flip a character well inside the body (past the header) to hit ciphertext.
+    let mid = text.len() / 2;
+    text[mid] = if text[mid] == b'A' { b'B' } else { b'A' };
+    let corrupted = work.path().join("corrupted");
+    fs::write(&corrupted, &text).unwrap();
+
+    let err = decompress(&DecompressOptions {
+        archive: corrupted,
+        password: "pw".to_string(),
+        output_dir: work.path().join("extract"),
+        force: false,
+    });
+    assert!(err.is_err(), "corrupted armored text must be rejected");
+}
+
+/// The headline case: the armored blob is pasted into the middle of an ordinary
+/// message — greeting and signature around it, and the blob itself reflowed
+/// across CRLF lines — yet foldlock finds and extracts it.
+#[test]
+fn armor_found_buried_in_an_email() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("notes");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: u64::MAX,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
+        armor: true,
+    })
+    .expect("armor compress failed");
+
+    let blob = fs::read_to_string(out_dir.join("notes.flk.txt")).unwrap();
+    // Wrap the blob across CRLF lines (breaks even fall inside the frame tokens).
+    let wrapped = blob
+        .as_bytes()
+        .chunks(48)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    // Bury it in a message with prose (full of base64-alphabet letters) around it.
+    let message = format!(
+        "Hi Bob,\r\n\r\nHere is the backup you asked for — paste the block below\r\n\
+         into foldlock to unpack it:\r\n\r\n{wrapped}\r\n\r\nThanks a lot!\r\nAlice\r\n"
+    );
+    let pasted = work.path().join("email.txt");
+    fs::write(&pasted, message).unwrap();
+
+    let extract_dir = work.path().join("extract");
+    let result = decompress(&DecompressOptions {
+        archive: pasted,
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("payload must be found inside surrounding prose");
+
+    assert_eq!(result.source, SourceKind::Armor);
+    assert_tree_matches(&extract_dir.join("notes"), &expected);
+}
+
+/// A plain text file that is not an archive must not be mistaken for armor; it
+/// falls through to the binary path and fails cleanly.
+#[test]
+fn unrelated_text_file_is_not_armor() {
+    let work = tempdir().unwrap();
+    let note = work.path().join("shopping-list.txt");
+    fs::write(&note, b"milk, eggs, bread\n").unwrap();
+
+    let err = decompress(&DecompressOptions {
+        archive: note,
+        password: "pw".to_string(),
+        output_dir: work.path().join("extract"),
+        force: false,
+    });
+    assert!(
+        err.is_err(),
+        "an unrelated file must not decode as an archive"
+    );
 }
