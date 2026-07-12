@@ -1,20 +1,26 @@
 //! `foldlock` — compress a folder, encrypt it with a password, and split it
 //! into fixed-size volumes (and the reverse).
 //!
-//! Pipeline: `tar` → `zstd` → ChaCha20-Poly1305 STREAM → split volumes.
+//! Pipeline: `tar` → compress (`zstd` or `xz`) → ChaCha20-Poly1305 STREAM →
+//! split volumes.
 //!
 //! On-disk layout of the logical stream (before volume splitting):
 //!
 //! ```text
-//! ┌────────── plaintext header ──────────┐┌──── AEAD ciphertext blocks ────┐
-//! │ "FLK1" │ ver │ salt[16] │ nprefix[7] ││ block₀ │ block₁ │ … │ blockₙ   │
-//! │ name_len(u16-le) │ name[name_len]    ││  (each: ciphertext ‖ tag[16])   │
-//! └──────────────────────────────────────┘└─────────────────────────────────┘
+//! ┌──────────────── plaintext header ────────────────┐┌── AEAD ciphertext ──┐
+//! │ "FLK1" │ ver │ algo │ salt[16] │ nprefix[7]       ││ block₀ │ … │ blockₙ │
+//! │ name_len(u16-le) │ name[name_len]                 ││ (ciphertext ‖ tag)  │
+//! └───────────────────────────────────────────────────┘└─────────────────────┘
 //! ```
+//!
+//! `algo` selects the compression backend (zstd or xz) and is present from
+//! header version 2 onward; version-1 archives have no `algo` byte and are
+//! always zstd.
 //!
 //! The full header is fed as AEAD additional-authenticated-data to the first
 //! block, so tampering with the salt, nonce, or stored name is detected.
 
+mod codec;
 mod crypto;
 mod volume;
 
@@ -27,12 +33,15 @@ use walkdir::WalkDir;
 use crypto::{derive_key, DecryptingReader, EncryptingWriter, NONCE_PREFIX_LEN, SALT_LEN};
 use volume::{VolumeReader, VolumeWriter};
 
-/// Compression level for zstd (1..=22). 19 is an excellent ratio/speed balance.
-const ZSTD_LEVEL: i32 = 19;
+pub use codec::Algorithm;
+use codec::{CompressWriter, DecompressReader};
+
 /// File extension marking a foldlock volume set: `<folder>.flk.NNN`.
 const ARCHIVE_EXT: &str = "flk";
 const MAGIC: &[u8; 4] = b"FLK1";
-const FORMAT_VERSION: u8 = 1;
+/// Header format version. v1 (zstd only, no algorithm byte) is still readable;
+/// v2 adds a one-byte compression-algorithm selector after the version.
+const FORMAT_VERSION: u8 = 2;
 /// Upper bound on the stored folder name, to reject corrupt headers cheaply.
 const MAX_NAME_LEN: usize = 4096;
 
@@ -46,6 +55,10 @@ pub struct CompressOptions {
     pub volume_size: u64,
     /// Directory the `<name>.flk.NNN` volumes are written to.
     pub output_dir: PathBuf,
+    /// Compression backend to use.
+    pub algorithm: Algorithm,
+    /// Explicit compression level; `None` uses the backend's default.
+    pub level: Option<i32>,
 }
 
 /// Result of a successful [`compress`].
@@ -110,7 +123,7 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
     getrandom::getrandom(&mut salt).map_err(|e| anyhow!("RNG failure: {e}"))?;
     getrandom::getrandom(&mut nonce_prefix).map_err(|e| anyhow!("RNG failure: {e}"))?;
 
-    let header = build_header(&salt, &nonce_prefix, &root_name)?;
+    let header = build_header(opts.algorithm, &salt, &nonce_prefix, &root_name)?;
     let key = derive_key(&opts.password, &salt)?;
 
     // Pre-collect entries before any volume is written, so that when we pack the
@@ -130,25 +143,28 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
         entries.push(entry);
     }
 
-    // Build the writer chain: volumes <- encrypt <- zstd <- tar.
+    // Build the writer chain: volumes <- encrypt <- compress <- tar.
     let mut volume_writer = VolumeWriter::new(base_path, opts.volume_size);
     volume_writer
         .write_all(&header)
         .context("failed to write archive header")?;
+
+    // Use every available core for the CPU-bound compression stage (zstd only;
+    // the xz backend runs single-threaded here). Multi-threading is best-effort:
+    // if it cannot be enabled, compression simply runs single-threaded.
+    let threads = if opts.algorithm == Algorithm::Xz {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+    };
+
     let encryptor = EncryptingWriter::new(volume_writer, &key, &nonce_prefix, header);
-    let mut zstd = zstd::Encoder::new(encryptor, ZSTD_LEVEL).context("failed to start zstd")?;
+    let comp = CompressWriter::new(encryptor, opts.algorithm, opts.level, threads)
+        .context("failed to start compressor")?;
 
-    // Use every available core for the CPU-bound compression stage. This is
-    // best-effort: if multi-threading cannot be enabled, compression simply
-    // runs single-threaded (still correct, just slower).
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(1);
-    if threads > 1 {
-        let _ = zstd.multithread(threads);
-    }
-
-    let mut builder = tar::Builder::new(zstd);
+    let mut builder = tar::Builder::new(comp);
     builder.follow_symlinks(false);
 
     for entry in &entries {
@@ -169,8 +185,8 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
         }
     }
 
-    let zstd = builder.into_inner().context("failed to finish tar")?;
-    let encryptor = zstd.finish().context("failed to finish zstd")?;
+    let comp = builder.into_inner().context("failed to finish tar")?;
+    let encryptor = comp.finish().context("failed to finish compression")?;
     let volume_writer = encryptor.finish().context("failed to finish encryption")?;
     let volumes = volume_writer.finish().context("failed to flush volumes")?;
 
@@ -192,36 +208,53 @@ pub fn decompress(opts: &DecompressOptions) -> Result<DecompressSummary> {
     let mut reader = VolumeReader::open(&opts.archive)?;
     let volumes_read = reader.volume_count();
 
-    // Read and validate the plaintext header.
-    let mut fixed = [0u8; 4 + 1 + SALT_LEN + NONCE_PREFIX_LEN + 2];
+    // Read and validate the plaintext header, accumulating the exact bytes so
+    // they can be replayed as the AEAD additional-authenticated-data.
+    let mut header: Vec<u8> = Vec::with_capacity(64);
+
+    let mut magic_ver = [0u8; 5];
     reader
-        .read_exact(&mut fixed)
+        .read_exact(&mut magic_ver)
         .context("archive is truncated (header)")?;
-    if &fixed[0..4] != MAGIC {
+    if &magic_ver[0..4] != MAGIC {
         bail!("not a foldlock archive (bad magic)");
     }
-    if fixed[4] != FORMAT_VERSION {
-        bail!("unsupported archive version {}", fixed[4]);
-    }
-    let salt: [u8; SALT_LEN] = fixed[5..5 + SALT_LEN].try_into().unwrap();
-    let nprefix_start = 5 + SALT_LEN;
-    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = fixed
-        [nprefix_start..nprefix_start + NONCE_PREFIX_LEN]
+    header.extend_from_slice(&magic_ver);
+
+    // Version gates the layout: v1 has no algorithm byte (always zstd); v2+
+    // stores the compression backend in one byte right after the version.
+    let algorithm = match magic_ver[4] {
+        1 => Algorithm::Zstd,
+        2 => {
+            let mut algo = [0u8; 1];
+            reader
+                .read_exact(&mut algo)
+                .context("archive is truncated (header)")?;
+            header.extend_from_slice(&algo);
+            Algorithm::from_byte(algo[0])?
+        }
+        v => bail!("unsupported archive version {v}"),
+    };
+
+    let mut rest = [0u8; SALT_LEN + NONCE_PREFIX_LEN + 2];
+    reader
+        .read_exact(&mut rest)
+        .context("archive is truncated (header)")?;
+    let salt: [u8; SALT_LEN] = rest[..SALT_LEN].try_into().unwrap();
+    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = rest[SALT_LEN..SALT_LEN + NONCE_PREFIX_LEN]
         .try_into()
         .unwrap();
-    let name_len = u16::from_le_bytes([fixed[fixed.len() - 2], fixed[fixed.len() - 1]]) as usize;
+    let name_len = u16::from_le_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]) as usize;
+    header.extend_from_slice(&rest);
     if name_len == 0 || name_len > MAX_NAME_LEN {
         bail!("corrupt header (name length {name_len})");
     }
+
     let mut name_bytes = vec![0u8; name_len];
     reader
         .read_exact(&mut name_bytes)
         .context("archive is truncated (name)")?;
     let root_name = String::from_utf8(name_bytes.clone()).context("corrupt header (name)")?;
-
-    // Reconstruct the exact header bytes that were authenticated as AAD.
-    let mut header = Vec::with_capacity(fixed.len() + name_len);
-    header.extend_from_slice(&fixed);
     header.extend_from_slice(&name_bytes);
 
     std::fs::create_dir_all(&opts.output_dir)
@@ -236,8 +269,9 @@ pub fn decompress(opts: &DecompressOptions) -> Result<DecompressSummary> {
 
     let key = derive_key(&opts.password, &salt)?;
     let decryptor = DecryptingReader::new(reader, &key, &nonce_prefix, header);
-    let zstd = zstd::Decoder::new(decryptor).context("failed to start zstd")?;
-    let mut archive = tar::Archive::new(zstd);
+    let decomp =
+        DecompressReader::new(decryptor, algorithm).context("failed to start decompressor")?;
+    let mut archive = tar::Archive::new(decomp);
     let extract_err = "failed to extract archive (wrong password or corrupted data?)";
 
     if opts.force && target.exists() {
@@ -285,8 +319,10 @@ fn remove_path(path: &Path) -> Result<()> {
     .with_context(|| format!("cannot remove '{}'", path.display()))
 }
 
-/// Build the plaintext header: magic, version, salt, nonce prefix, and name.
+/// Build the plaintext header: magic, version, algorithm, salt, nonce prefix,
+/// and name.
 fn build_header(
+    algorithm: Algorithm,
     salt: &[u8; SALT_LEN],
     nonce_prefix: &[u8; NONCE_PREFIX_LEN],
     name: &str,
@@ -295,9 +331,11 @@ fn build_header(
     if name_bytes.len() > MAX_NAME_LEN {
         bail!("folder name too long ({} bytes)", name_bytes.len());
     }
-    let mut header = Vec::with_capacity(4 + 1 + SALT_LEN + NONCE_PREFIX_LEN + 2 + name_bytes.len());
+    let mut header =
+        Vec::with_capacity(4 + 1 + 1 + SALT_LEN + NONCE_PREFIX_LEN + 2 + name_bytes.len());
     header.extend_from_slice(MAGIC);
     header.push(FORMAT_VERSION);
+    header.push(algorithm.to_byte());
     header.extend_from_slice(salt);
     header.extend_from_slice(nonce_prefix);
     header.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
