@@ -23,7 +23,7 @@ Extracted ./photos
 - **Excellent compression** — zstd at level 19 by default, with optional zstd-ultra (`-l 22`) or xz/LZMA (`--max`) for maximum density.
 - **Uses every CPU core** — multi-threaded compression (the only CPU-bound stage) scales across all cores automatically.
 - **Splits into volumes** — choose any volume size in MiB; great for size-limited storage, uploads, or transfer.
-- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No markers, just characters. Ideal for small (byte/kilobyte) secrets.
+- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No visible markers, just characters — and it can even be pasted **in the middle of other text** (a message, a signature) and still be found. Ideal for small (byte/kilobyte) secrets.
 - **Tiny & self-contained** — a single ~1 MB binary, no runtime dependencies, optimized for size.
 - **Safe by default** — refuses to overwrite an existing folder; can prompt for the password without echoing it.
 
@@ -103,7 +103,7 @@ $ cat notes.flk.txt
 RkxLMQIAmr8Vmb8SJagY2IwuLYKJ5XCW7CwTujMFAG5vdGVzBd1k/rtgQINjOK2Uz…
 ```
 
-Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, and stray whitespace are all tolerated), and decompress it by that name — foldlock detects that it's armored and restores the original folder:
+Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, stray whitespace, and even non‑ASCII junk like non‑breaking spaces are all tolerated — and the block may sit **in the middle of other text**, e.g. an email with a greeting and a signature), and decompress it by that name — foldlock finds the armored block and restores the original folder:
 
 ```console
 $ foldlock decompress ./one s3cret

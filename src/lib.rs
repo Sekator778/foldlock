@@ -175,7 +175,7 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
         let armor_path = opts.output_dir.join(format!("{base_name}.txt"));
         let file = File::create(&armor_path)
             .with_context(|| format!("cannot create '{}'", armor_path.display()))?;
-        Sink::Armor(ArmorWriter::new(BufWriter::new(file)), armor_path)
+        Sink::Armor(ArmorWriter::new(BufWriter::new(file))?, armor_path)
     } else {
         Sink::Volumes(VolumeWriter::new(base_path, opts.volume_size))
     };

@@ -2,20 +2,26 @@
 //!
 //! The binary archive stream (the plaintext `FLK1` header followed by the AEAD
 //! ciphertext) is base64-encoded into a single continuous run of characters with
-//! *no envelope at all* — no markers, no header lines, no visible checksum. To a
-//! human it is just a string of characters; the application recognizes it purely
-//! from its structure (see [`decode`]).
+//! *no human-readable envelope* — no `BEGIN`/`END` lines, no headers. To a human
+//! it is just a string of characters.
+//!
+//! To let the payload be pasted **inside arbitrary surrounding text** (a chat
+//! message, an email with a greeting and a signature, quoted lines) it is
+//! bracketed by two hidden [frame delimiters](FRAME_START): fixed, random-looking
+//! runs of base64 characters that are indistinguishable by eye from the payload
+//! but let the decoder find where the payload begins and ends.
 //!
 //! Armor is a pure, reversible transport encoding: it changes nothing about the
-//! encryption. An armored blob decodes to the *exact same bytes* the binary
+//! encryption. The framed payload decodes to the *exact same bytes* the binary
 //! volume path produces, so integrity is handled entirely by the existing AEAD
-//! (ChaCha20-Poly1305 STREAM) — a copied-wrong or truncated blob fails to
-//! authenticate rather than producing garbage.
+//! (ChaCha20-Poly1305 STREAM).
 //!
-//! The [encoder](ArmorWriter) streams in three-byte groups (bounded memory,
-//! independent of payload size). The [decoder](decode) is deliberately liberal:
-//! it drops all ASCII whitespace and a UTF-8 BOM, so CRLF line endings, wrapped
-//! lines, or stray spaces introduced by a clipboard round-trip are all tolerated.
+//! The [decoder](decode) is maximally forgiving of a clipboard round-trip: it
+//! first discards *every* byte that is not a base64 data symbol — ASCII
+//! whitespace, injected line breaks of any flavor (even ones that land inside a
+//! frame token), a BOM, non-breaking spaces, zero-width characters, Unicode
+//! line/paragraph separators, quotes, and `=` padding — then locates the frame
+//! and decodes what is between. Missing padding is fine too.
 
 use std::io::{self, Write};
 
@@ -38,9 +44,20 @@ const DECODE: [u8; 256] = {
     table
 };
 
+/// Hidden frame delimiters bracketing the payload. They are deliberately
+/// random-looking runs of base64 characters — indistinguishable by eye from the
+/// payload itself — yet let the decoder pick the payload out of arbitrary
+/// surrounding text. At 16 characters each, an accidental collision inside a
+/// payload is about `2^-96`. The two tokens are distinct so a stray copy of one
+/// cannot be mistaken for the other.
+const FRAME_START: &[u8] = b"o3Qv9Xz1Lp7Rk2Bf";
+const FRAME_END: &[u8] = b"e8Wn4Yc6Hs0Jd5Tg";
+
 /// A `Write` sink that base64-encodes everything written to it and forwards the
-/// characters to `inner` as one unbroken line. Construction writes nothing;
-/// call [`finish`](ArmorWriter::finish) to emit the final (padded) group.
+/// characters to `inner` as one unbroken line, bracketed by the hidden frame
+/// tokens. [`new`](ArmorWriter::new) writes the opening token; call
+/// [`finish`](ArmorWriter::finish) to emit the final (padded) group and the
+/// closing token.
 ///
 /// At most two raw bytes are ever buffered (an incomplete trailing group), so
 /// memory use is constant regardless of how much data flows through.
@@ -54,21 +71,19 @@ pub struct ArmorWriter<W: Write> {
 }
 
 impl<W: Write> ArmorWriter<W> {
-    /// Wrap `inner`. No bytes are written until data flows in or [`finish`]
-    /// is called.
-    ///
-    /// [`finish`]: ArmorWriter::finish
-    pub fn new(inner: W) -> Self {
-        Self {
+    /// Wrap `inner` and write the opening frame token.
+    pub fn new(mut inner: W) -> io::Result<Self> {
+        inner.write_all(FRAME_START)?;
+        Ok(Self {
             inner,
             carry: [0u8; 3],
             carry_len: 0,
             scratch: Vec::new(),
-        }
+        })
     }
 
-    /// Emit the final partial group (with `=` padding) and return the inner
-    /// writer, flushed.
+    /// Emit the final partial group (with `=` padding) and the closing frame
+    /// token, then return the inner writer, flushed.
     pub fn finish(mut self) -> io::Result<W> {
         let mut tail = [0u8; 4];
         let n = match self.carry_len {
@@ -94,6 +109,7 @@ impl<W: Write> ArmorWriter<W> {
         if n > 0 {
             self.inner.write_all(&tail[..n])?;
         }
+        self.inner.write_all(FRAME_END)?;
         self.inner.flush()?;
         Ok(self.inner)
     }
@@ -141,35 +157,33 @@ impl<W: Write> Write for ArmorWriter<W> {
 
 /// Decode armored text back into the raw archive bytes.
 ///
-/// Whitespace and a leading BOM are ignored. Returns:
-/// - `Ok(Some(bytes))` when `input`, once cleaned, is valid base64 that decodes
-///   to a stream beginning with `magic` — i.e. it is one of ours;
-/// - `Ok(None)` otherwise (foreign characters, invalid base64, or a decoded
-///   prefix that is not `magic`), so the caller can fall back to the binary path.
+/// The whole input is first reduced to just its base64 data characters, so any
+/// junk — including newlines injected *inside* a frame token, and any prose
+/// punctuation — disappears. The payload is then located by its hidden frame
+/// (`FRAME_START` … `FRAME_END`), which lets it be buried in surrounding text.
+/// Files written before framing existed (or a bare blob pasted on its own) are
+/// still handled by a whole-stream fallback.
+///
+/// Returns `Ok(Some(bytes))` when the decoded stream begins with `magic` — i.e.
+/// it is one of ours — and `Ok(None)` otherwise, so the caller can fall back to
+/// the binary/volume path.
 pub fn decode(input: &[u8], magic: &[u8]) -> Result<Option<Vec<u8>>> {
-    let input = strip_bom(input);
+    let chars = keep_base64_chars(input);
 
-    // Collect base64 symbols, dropping whitespace. A single foreign byte means
-    // this is not an armored blob at all.
-    let mut cleaned: Vec<u8> = Vec::with_capacity(input.len());
-    for &byte in input {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        if byte == b'=' || DECODE[byte as usize] != INVALID {
-            cleaned.push(byte);
-        } else {
-            return Ok(None);
+    // Preferred form: the payload is bracketed by hidden frame tokens, so it can
+    // sit inside arbitrary surrounding text. Slice out START..END and decode it.
+    if let Some(region) = between(&chars, FRAME_START, FRAME_END) {
+        if let Some(bytes) = sextets_to_bytes(region) {
+            if bytes.starts_with(magic) {
+                return Ok(Some(bytes));
+            }
         }
     }
-    if cleaned.is_empty() {
-        return Ok(None);
-    }
 
-    match base64_decode(&cleaned) {
-        Some(decoded) if decoded.starts_with(magic) => Ok(Some(decoded)),
-        _ => Ok(None),
-    }
+    // Fallback: an un-framed blob (an older armored file, or a blob pasted on its
+    // own). Trusted only when it decodes to our magic, so unrelated text and
+    // surrounding prose are rejected.
+    Ok(sextets_to_bytes(&chars).filter(|bytes| bytes.starts_with(magic)))
 }
 
 /// Encode one full three-byte group into four base64 characters.
@@ -183,52 +197,77 @@ fn encode_group(g: &[u8]) -> [u8; 4] {
     ]
 }
 
-/// Decode whitespace-free base64 (with optional trailing `=` padding). Returns
-/// `None` on any structural error, since without an envelope we cannot tell a
-/// corrupted archive from an unrelated file — the caller treats both as "not
-/// ours".
-fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
-    if s.len() % 4 != 0 {
-        return None;
+/// Copy out only the base64 data characters, dropping everything else (all
+/// whitespace, BOMs, non-ASCII junk, `=` padding, surrounding punctuation).
+fn keep_base64_chars(input: &[u8]) -> Vec<u8> {
+    let mut chars = Vec::with_capacity(input.len());
+    for &byte in input {
+        if DECODE[byte as usize] != INVALID {
+            chars.push(byte);
+        }
     }
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let mut i = 0;
-    while i < s.len() {
-        let v0 = DECODE[s[i] as usize];
-        let v1 = DECODE[s[i + 1] as usize];
-        if v0 == INVALID || v1 == INVALID {
-            return None;
-        }
-        out.push((v0 << 2) | (v1 >> 4));
-
-        // Padding is only ever valid in the final quantum.
-        let last = i + 4 == s.len();
-        if s[i + 2] == b'=' {
-            return (last && s[i + 3] == b'=').then_some(out);
-        }
-        let v2 = DECODE[s[i + 2] as usize];
-        if v2 == INVALID {
-            return None;
-        }
-        out.push((v1 << 4) | (v2 >> 2));
-
-        if s[i + 3] == b'=' {
-            return last.then_some(out);
-        }
-        let v3 = DECODE[s[i + 3] as usize];
-        if v3 == INVALID {
-            return None;
-        }
-        out.push((v2 << 6) | v3);
-        i += 4;
-    }
-    Some(out)
+    chars
 }
 
-/// Strip a leading UTF-8 byte-order mark, if present.
-#[inline]
-fn strip_bom(input: &[u8]) -> &[u8] {
-    input.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(input)
+/// The slice of `hay` strictly between the first occurrence of `start` and the
+/// first occurrence of `end` after it. `None` if either token is missing.
+fn between<'a>(hay: &'a [u8], start: &[u8], end: &[u8]) -> Option<&'a [u8]> {
+    let s = find(hay, start)?;
+    let after = s + start.len();
+    let e = find(&hay[after..], end)?;
+    Some(&hay[after..after + e])
+}
+
+/// Index of the first occurrence of `needle` in `hay`, if any.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Pack a run of base64 characters back into bytes. The `=` padding is optional
+/// — the byte count is inferred from how many characters there are (2 chars → 1
+/// byte, 3 → 2 bytes). Returns `None` only when the count is structurally
+/// impossible (`len % 4 == 1`, a lone character carrying fewer than 8 bits).
+///
+/// `chars` must contain only base64 data characters (as produced by
+/// [`keep_base64_chars`]); any stray byte simply maps through the table.
+fn sextets_to_bytes(chars: &[u8]) -> Option<Vec<u8>> {
+    if chars.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(chars.len() / 4 * 3 + 2);
+    let mut quads = chars.chunks_exact(4);
+    for q in &mut quads {
+        let (a, b, c, d) = (
+            DECODE[q[0] as usize],
+            DECODE[q[1] as usize],
+            DECODE[q[2] as usize],
+            DECODE[q[3] as usize],
+        );
+        out.push((a << 2) | (b >> 4));
+        out.push((b << 4) | (c >> 2));
+        out.push((c << 6) | d);
+    }
+    match quads.remainder() {
+        [] => {}
+        [a, b] => {
+            let (a, b) = (DECODE[*a as usize], DECODE[*b as usize]);
+            out.push((a << 2) | (b >> 4));
+        }
+        [a, b, c] => {
+            let (a, b, c) = (
+                DECODE[*a as usize],
+                DECODE[*b as usize],
+                DECODE[*c as usize],
+            );
+            out.push((a << 2) | (b >> 4));
+            out.push((b << 4) | (c >> 2));
+        }
+        _ => unreachable!("remainder of chunks_exact(4) is always < 4"),
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -237,9 +276,26 @@ mod tests {
 
     /// Encode `data` through the streaming writer, returning the armored bytes.
     fn armor(data: &[u8]) -> Vec<u8> {
-        let mut w = ArmorWriter::new(Vec::new());
+        let mut w = ArmorWriter::new(Vec::new()).unwrap();
         w.write_all(data).unwrap();
         w.finish().unwrap()
+    }
+
+    /// Decode the whole (framed or bare) blob's base64, ignoring the magic check.
+    fn decode_lenient(input: &[u8]) -> Option<Vec<u8>> {
+        sextets_to_bytes(&keep_base64_chars(input))
+    }
+
+    #[test]
+    fn output_is_pure_base64_bracketed_by_the_frame() {
+        let text = armor(b"FLK1 hello world payload");
+        assert!(text.starts_with(FRAME_START), "must open with the frame");
+        assert!(text.ends_with(FRAME_END), "must close with the frame");
+        assert!(
+            text.iter()
+                .all(|&b| b == b'=' || DECODE[b as usize] != INVALID),
+            "armored output must be pure base64 characters"
+        );
     }
 
     #[test]
@@ -247,20 +303,17 @@ mod tests {
         for len in 0..256usize {
             let data: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(7) + 3) as u8).collect();
             let text = armor(&data);
-            // Output is pure base64: only alphabet characters and padding.
-            assert!(
-                text.iter()
-                    .all(|&b| b == b'=' || DECODE[b as usize] != INVALID),
-                "len {len}: armored output must be pure base64"
-            );
-            assert_eq!(base64_decode(&text).unwrap(), data, "len {len}");
+            // Strip the fixed-length frame and decode the payload base64 (via the
+            // same padding-tolerant path the real decoder uses).
+            let inner = &text[FRAME_START.len()..text.len() - FRAME_END.len()];
+            assert_eq!(decode_lenient(inner).unwrap(), data, "len {len}");
         }
     }
 
     #[test]
     fn feeding_in_odd_sized_chunks_matches_a_single_write() {
         let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let mut w = ArmorWriter::new(Vec::new());
+        let mut w = ArmorWriter::new(Vec::new()).unwrap();
         for chunk in data.chunks(7) {
             w.write_all(chunk).unwrap();
         }
@@ -276,22 +329,44 @@ mod tests {
     }
 
     #[test]
-    fn decode_tolerates_bom_crlf_and_stray_whitespace() {
-        let data: Vec<u8> = (0..500).map(|i| (i % 251) as u8).collect();
-        let mut prefixed = vec![0u8; 4];
-        prefixed[..4].copy_from_slice(b"FLK1");
-        prefixed.extend_from_slice(&data);
-        let text = armor(&prefixed);
+    fn decode_finds_payload_buried_in_prose() {
+        let data = b"FLK1 the real payload bytes \x00\xff".to_vec();
+        let blob = String::from_utf8(armor(&data)).unwrap();
+        // Bury it in an email, wrapping the blob across CRLF lines mid-token.
+        let wrapped = blob
+            .as_bytes()
+            .chunks(9)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let message = format!(
+            "Hi Bob,\r\n\r\npaste this into foldlock:\r\n{wrapped}\r\n\r\nCheers, Alice\r\n"
+        );
+        assert_eq!(decode(message.as_bytes(), b"FLK1").unwrap().unwrap(), data);
+    }
 
-        // Simulate a hostile clipboard: a BOM, CRLF endings, injected blank lines.
-        let mut messy = vec![0xEF, 0xBB, 0xBF];
-        for (i, &b) in text.iter().enumerate() {
-            messy.push(b);
-            if i % 37 == 36 {
-                messy.extend_from_slice(b"\r\n  \t");
+    #[test]
+    fn decode_survives_nonascii_junk_and_missing_padding() {
+        // An 8-byte payload (len % 3 == 2) so base64 emits a '=' pad, letting us
+        // prove padding is optional on the way back in.
+        let data = b"FLK1 pad".to_vec();
+        let armored = armor(&data);
+        assert!(armored.contains(&b'='), "fixture should exercise padding");
+
+        // Strip the '=' padding and pepper the blob with non-ASCII junk that a
+        // naive whitespace-only filter would choke on.
+        let junk: &[u8] = "\r\n\u{00A0}\u{200B}\u{2028}\"' ".as_bytes();
+        let mut mangled = Vec::new();
+        for (i, &b) in armored.iter().enumerate() {
+            if b == b'=' {
+                continue;
+            }
+            mangled.push(b);
+            if i % 3 == 0 {
+                mangled.extend_from_slice(junk);
             }
         }
-        assert_eq!(decode(&messy, b"FLK1").unwrap().unwrap(), prefixed);
+        assert_eq!(decode(&mangled, b"FLK1").unwrap().unwrap(), data);
     }
 
     #[test]
@@ -308,9 +383,13 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_rejects_malformed_input() {
-        assert!(base64_decode(b"AAA").is_none()); // not a multiple of 4
-        assert!(base64_decode(b"A=AA").is_none()); // padding not at the end
-        assert!(base64_decode(b"====").is_none()); // padding with no data
+    fn lenient_decode_only_rejects_impossible_lengths() {
+        assert!(decode_lenient(b"A").is_none()); // 1 char: < 8 bits
+        assert_eq!(decode_lenient(b"").unwrap(), Vec::<u8>::new());
+        // Padded and unpadded forms of the same data agree.
+        assert_eq!(
+            decode_lenient(b"TWE=").unwrap(),
+            decode_lenient(b"TWE").unwrap()
+        );
     }
 }
