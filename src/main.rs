@@ -17,15 +17,19 @@ foldlock — compress a folder, encrypt it with a password, split it into volume
 
 USAGE:
     foldlock compress   <folder> <password> <size_MiB>
+    foldlock compress   <folder> <password> --armor
     foldlock decompress <archive> [password]
 
 COMMANDS:
     compress     Pack <folder>, encrypt with <password>, and split into
                  <size_MiB>-MiB volumes named <folder>.flk.001, .002, …
-    decompress   Reassemble, decrypt, and extract a <archive> volume set.
-                 <archive> is the base name (photos.flk) or any volume
-                 (photos.flk.001). The original folder name and volume size
-                 are recovered from the archive, so no size argument is needed.
+                 With --armor, write one copy-pasteable text file instead
+                 (<folder>.flk.txt) and take no size argument.
+    decompress   Reassemble, decrypt, and extract an <archive>. <archive> is the
+                 base name (photos.flk), any volume (photos.flk.001), or an
+                 armored text file — the kind is detected from its content. The
+                 original folder name and volume size are recovered from the
+                 archive, so no size argument is needed.
 
 PASSWORD:
     Pass the password as an argument, or use '-' to be prompted without echo.
@@ -41,6 +45,9 @@ OPTIONS:
                            (default 19); xz: 0..=9 (default 9). zstd levels
                            20..=22 enable a wider window for higher density.
         --max              Shortcut for '--algo xz' (maximum density).
+        --armor            Write a single copy-pasteable base64 text file instead
+                           of binary volumes (compress only; takes no size arg).
+                           decompress detects an armored file automatically.
     -f, --force            Overwrite the destination folder if it already exists
                            (decompress only).
     -h, --help             Print this help.
@@ -54,8 +61,10 @@ EXAMPLES:
     foldlock compress ./photos - 100 --max         # maximum density (xz)
     foldlock compress ./src s3cret 100 -l 22       # zstd ultra
     foldlock compress ./photos - 100               # prompt for the password
+    foldlock compress ./notes s3cret --armor       # one base64 text blob to paste
     foldlock decompress ./photos.flk s3cret
     foldlock decompress ./photos.flk.001 -         # prompt for the password
+    foldlock decompress ./notes.flk.txt s3cret     # armored file, auto-detected
 ";
 
 fn main() -> ExitCode {
@@ -94,6 +103,7 @@ fn run() -> Result<()> {
     // Parse the remaining tokens. A literal "--" ends option parsing, so any
     // value (even one that looks like a flag) can follow it positionally.
     let mut force = false;
+    let mut armor = false;
     let mut algo: Option<String> = None;
     let mut level: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -110,6 +120,7 @@ fn run() -> Result<()> {
         match arg {
             "--" => options_done = true,
             "-f" | "--force" => force = true,
+            "--armor" => armor = true,
             "--max" => algo = Some("xz".to_string()),
             "-a" | "--algo" => {
                 i += 1;
@@ -154,11 +165,11 @@ fn run() -> Result<()> {
             if force {
                 bail!("--force is only valid for 'decompress'");
             }
-            run_compress(&positionals, algo.as_deref(), level.as_deref())
+            run_compress(&positionals, algo.as_deref(), level.as_deref(), armor)
         }
         "decompress" => {
-            if algo.is_some() || level.is_some() {
-                bail!("--algo/--level are only valid for 'compress'");
+            if algo.is_some() || level.is_some() || armor {
+                bail!("--algo/--level/--armor are only valid for 'compress'");
             }
             run_decompress(&positionals, force)
         }
@@ -166,27 +177,46 @@ fn run() -> Result<()> {
     }
 }
 
-fn run_compress(positionals: &[String], algo: Option<&str>, level: Option<&str>) -> Result<()> {
-    if positionals.len() != 3 {
-        bail!("compress expects: <folder> <password> <size_MiB> (try 'foldlock --help')");
-    }
-    let source = PathBuf::from(&positionals[0]);
+fn run_compress(
+    positionals: &[String],
+    algo: Option<&str>,
+    level: Option<&str>,
+    armor: bool,
+) -> Result<()> {
+    // Armor writes a single text file, so it takes no volume-size argument.
+    let (folder, password_arg, size_arg) = if armor {
+        match positionals {
+            [f, p] => (f, p, None),
+            _ => bail!(
+                "compress --armor expects: <folder> <password> (no size — output is one text file)"
+            ),
+        }
+    } else {
+        match positionals {
+            [f, p, s] => (f, p, Some(s)),
+            _ => bail!("compress expects: <folder> <password> <size_MiB> (try 'foldlock --help')"),
+        }
+    };
+    let source = PathBuf::from(folder);
     if !source.exists() {
         bail!("source '{}' does not exist", source.display());
     }
-    let password = resolve_password(Some(&positionals[1]), true)?;
-    let size_mib: u64 = positionals[2].parse().with_context(|| {
-        format!(
-            "invalid size '{}' (expected a number of MiB)",
-            positionals[2]
-        )
-    })?;
-    if size_mib == 0 {
-        bail!("volume size must be at least 1 MiB");
-    }
-    let volume_size = size_mib
-        .checked_mul(1024 * 1024)
-        .context("volume size is too large")?;
+    let password = resolve_password(Some(password_arg), true)?;
+    let volume_size = match size_arg {
+        Some(s) => {
+            let size_mib: u64 = s
+                .parse()
+                .with_context(|| format!("invalid size '{s}' (expected a number of MiB)"))?;
+            if size_mib == 0 {
+                bail!("volume size must be at least 1 MiB");
+            }
+            size_mib
+                .checked_mul(1024 * 1024)
+                .context("volume size is too large")?
+        }
+        // Armor ignores the volume size; a huge cap keeps everything in one blob.
+        None => u64::MAX,
+    };
 
     let algorithm: Algorithm = match algo {
         Some(s) => s.parse()?,
@@ -218,9 +248,10 @@ fn run_compress(positionals: &[String], algo: Option<&str>, level: Option<&str>)
         output_dir: PathBuf::from("."),
         algorithm,
         level,
+        armor,
     };
     let summary = compress(&opts)?;
-    report_compress(&summary, size_mib, algorithm, level);
+    report_compress(&summary);
     Ok(())
 }
 
@@ -250,10 +281,6 @@ fn resolve_password(arg: Option<&str>, confirm: bool) -> Result<String> {
             if pw.is_empty() {
                 bail!("password must not be empty");
             }
-            eprintln!(
-                "warning: passing the password as an argument exposes it via the process \
-                 list and shell history; prefer '-' (prompt) or FOLDLOCK_PASSWORD."
-            );
             return Ok(pw.to_string());
         }
     }
@@ -276,57 +303,16 @@ fn resolve_password(arg: Option<&str>, confirm: bool) -> Result<String> {
     Ok(password)
 }
 
-fn report_compress(
-    summary: &CompressSummary,
-    size_mib: u64,
-    algorithm: Algorithm,
-    level: Option<i32>,
-) {
-    let level_note = match level {
-        Some(n) => format!(" level {n}"),
-        None => String::new(),
-    };
-    println!(
-        "Created {} volume(s) of up to {} MiB ({} total, {}{}, {} thread(s)):",
-        summary.volumes.len(),
-        size_mib,
-        human_bytes(summary.total_bytes),
-        algorithm.as_str(),
-        level_note,
-        summary.threads
-    );
-    for path in &summary.volumes {
-        let len = path.metadata().map(|m| m.len()).unwrap_or(0);
-        println!("  {}  ({})", path.display(), human_bytes(len));
-    }
-    if summary.skipped_symlinks > 0 {
-        println!(
-            "note: skipped {} symlink(s) (not supported in this version)",
-            summary.skipped_symlinks
-        );
+/// Print a single concise confirmation line — the output location and nothing
+/// more (no per-file dump, sizes, or thread counts).
+fn report_compress(summary: &CompressSummary) {
+    if summary.armored {
+        println!("Created {}", summary.volumes[0].display());
+    } else {
+        println!("Created {} volume(s)", summary.volumes.len());
     }
 }
 
 fn report_decompress(summary: &DecompressSummary) {
-    println!(
-        "Extracted '{}' from {} volume(s).",
-        summary.output.display(),
-        summary.volumes_read
-    );
-}
-
-/// Format a byte count as a short human-readable string.
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    println!("Extracted {}", summary.output.display());
 }
