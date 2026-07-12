@@ -10,14 +10,10 @@ Think `tar | zstd | encrypt | split`, but a single ~1 MB self-contained binary w
 
 ```console
 $ foldlock compress ./photos s3cret 100
-Created 11 volume(s) of up to 100 MiB (1.0 GiB total, 48 thread(s)):
-  ./photos.flk.001  (100.0 MiB)
-  ./photos.flk.002  (100.0 MiB)
-  ...
-  ./photos.flk.011  (47.3 MiB)
+Created 11 volume(s)
 
 $ foldlock decompress ./photos.flk s3cret
-Extracted './photos' from 11 volume(s).
+Extracted ./photos
 ```
 
 ## ✨ Features
@@ -27,6 +23,7 @@ Extracted './photos' from 11 volume(s).
 - **Excellent compression** — zstd at level 19 by default, with optional zstd-ultra (`-l 22`) or xz/LZMA (`--max`) for maximum density.
 - **Uses every CPU core** — multi-threaded compression (the only CPU-bound stage) scales across all cores automatically.
 - **Splits into volumes** — choose any volume size in MiB; great for size-limited storage, uploads, or transfer.
+- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No visible markers, just characters — and it can even be pasted **in the middle of other text** (a message, a signature) and still be found. Ideal for small (byte/kilobyte) secrets.
 - **Tiny & self-contained** — a single ~1 MB binary, no runtime dependencies, optimized for size.
 - **Safe by default** — refuses to overwrite an existing folder; can prompt for the password without echoing it.
 
@@ -90,6 +87,31 @@ foldlock compress ./src s3cret 100 --algo xz -l 6   # xz, custom level
 
 The backend is recorded in the archive header, so **decompression detects it automatically** — no flag needed.
 
+#### Copy-paste (armored) archives
+
+For small payloads — secrets, configs, keys, notes — you can emit the whole archive as a single continuous line of base64 text instead of binary volumes. `--armor` takes **no size argument** (the output is one file):
+
+```console
+$ foldlock compress ./notes s3cret --armor
+Created ./notes.flk.txt
+```
+
+The file is an opaque run of characters with **no markers or headers** — foldlock recognizes it purely from its structure:
+
+```console
+$ cat notes.flk.txt
+RkxLMQIAmr8Vmb8SJagY2IwuLYKJ5XCW7CwTujMFAG5vdGVzBd1k/rtgQINjOK2Uz…
+```
+
+Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, stray whitespace, and even non‑ASCII junk like non‑breaking spaces are all tolerated — and the block may sit **in the middle of other text**, e.g. an email with a greeting and a signature), and decompress it by that name — foldlock finds the armored block and restores the original folder:
+
+```console
+$ foldlock decompress ./one s3cret
+Extracted ./notes
+```
+
+`--armor` is meant for **small data**: base64 adds ~33%, and clipboards/chats have limits — for large data, use binary volumes. Integrity is unchanged: the same authenticated encryption still detects any tampering or copy-paste corruption. If a file isn't a valid armored blob, foldlock falls back to the normal binary/volume path.
+
 ### Decompress
 
 ```sh
@@ -150,6 +172,14 @@ unset FOLDLOCK_PASSWORD
 foldlock compress ./logs s3cret 100 -l 22
 ```
 
+**A small secret you can paste anywhere** (armored text, no markers):
+
+```sh
+foldlock compress ./ssh-keys - --armor    # → ssh-keys.flk.txt (one line of base64)
+# copy the characters, paste into a file on another machine (any name), then:
+foldlock decompress ./ssh-keys.flk.txt -   # auto-detected, prompts for the password
+```
+
 **Restore** — no size or algorithm needed, both are read from the archive:
 
 ```sh
@@ -172,6 +202,8 @@ foldlock decompress ./notes.flk -         # → recreates ./notes, byte-identica
 compress:   folder ─▶ tar ─▶ compress (zstd or xz) ─▶ ChaCha20-Poly1305 STREAM ─▶ split into .NNN volumes
 decompress: .NNN volumes ─▶ join ─▶ decrypt + verify ─▶ decompress ─▶ untar ─▶ folder
 ```
+
+With `--armor`, the final split stage is replaced by a base64 encoder that writes one text file; `decompress` sniffs the input and base64-decodes it back into the exact same byte stream before the usual join/decrypt/… path. Armor is a pure transport encoding — the encrypted bytes are identical either way.
 
 Each archive begins with a small plaintext header (magic, version, a random 16-byte salt, a random 7-byte nonce prefix, and the folder name). The header is fed as **additional authenticated data** to the first encryption block, so any tampering with it is detected.
 
