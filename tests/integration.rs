@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use foldlock::{compress, decompress, CompressOptions, DecompressOptions};
+use foldlock::{compress, decompress, Algorithm, CompressOptions, DecompressOptions};
 use tempfile::tempdir;
 
 /// Deterministic, incompressible-ish bytes (so the compressed stream is large
@@ -87,6 +87,8 @@ fn roundtrip_tiny_volumes_force_midblock_splits() {
         password: "correct horse battery staple".to_string(),
         volume_size: 4 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .expect("compress failed");
 
@@ -125,6 +127,8 @@ fn roundtrip_single_large_volume() {
         password: "pw".to_string(),
         volume_size: 1024 * 1024 * 1024, // 1 GiB => everything in one volume
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -154,6 +158,8 @@ fn wrong_password_is_rejected() {
         password: "right".to_string(),
         volume_size: 8 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -180,6 +186,8 @@ fn refuses_to_overwrite_without_force() {
         password: "pw".to_string(),
         volume_size: 64 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -226,6 +234,8 @@ fn skips_own_output_volumes_when_packing_in_place() {
         password: "pw".to_string(),
         volume_size: 4 * 1024,
         output_dir: source.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -259,6 +269,8 @@ fn force_replaces_stale_files() {
         password: "pw".to_string(),
         volume_size: 64 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -304,6 +316,8 @@ fn failed_force_preserves_existing_folder() {
         password: "right".to_string(),
         volume_size: 64 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
 
@@ -348,6 +362,8 @@ fn empty_password_is_rejected() {
         password: String::new(),
         volume_size: 64 * 1024,
         output_dir: work.path().join("out"),
+        algorithm: Algorithm::Zstd,
+        level: None,
     });
     assert!(err.is_err(), "empty password must be rejected");
 }
@@ -365,6 +381,8 @@ fn missing_interior_volume_is_detected() {
         password: "pw".to_string(),
         volume_size: 4 * 1024,
         output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: None,
     })
     .unwrap();
     assert!(summary.volumes.len() >= 3);
@@ -383,4 +401,69 @@ fn missing_interior_volume_is_detected() {
         msg.contains("missing volume"),
         "interior gap should be reported clearly, got: {msg}"
     );
+}
+
+#[test]
+fn roundtrip_xz_backend() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("payload");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    // Compress with the xz backend; tiny volumes force mid-block splits.
+    let summary = compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: 4 * 1024,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Xz,
+        level: None,
+    })
+    .expect("xz compress failed");
+    assert!(summary.volumes.len() > 1, "expected several volumes");
+
+    // Decompress needs no algorithm flag — the backend is read from the header.
+    let extract_dir = work.path().join("extract");
+    decompress(&DecompressOptions {
+        archive: out_dir.join("payload.flk"),
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("xz decompress failed");
+
+    assert_tree_matches(&extract_dir.join("payload"), &expected);
+}
+
+#[test]
+fn roundtrip_zstd_ultra_level() {
+    let work = tempdir().unwrap();
+    let source = work.path().join("payload");
+    fs::create_dir_all(&source).unwrap();
+    let expected = build_fixture(&source);
+    let out_dir = work.path().join("out");
+
+    // Level 22 exercises the ultra path (wide window + long-distance matching),
+    // which the decoder must accept via its raised window_log_max.
+    compress(&CompressOptions {
+        source: source.clone(),
+        password: "pw".to_string(),
+        volume_size: 1024 * 1024,
+        output_dir: out_dir.clone(),
+        algorithm: Algorithm::Zstd,
+        level: Some(22),
+    })
+    .expect("zstd ultra compress failed");
+
+    let extract_dir = work.path().join("extract");
+    decompress(&DecompressOptions {
+        archive: out_dir.join("payload.flk"),
+        password: "pw".to_string(),
+        output_dir: extract_dir.clone(),
+        force: false,
+    })
+    .expect("zstd ultra decompress failed");
+
+    assert_tree_matches(&extract_dir.join("payload"), &expected);
 }
