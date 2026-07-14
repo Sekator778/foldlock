@@ -23,7 +23,8 @@ Extracted ./photos
 - **Excellent compression** — zstd at level 19 by default, with optional zstd-ultra (`-l 22`) or xz/LZMA (`--max`) for maximum density.
 - **Uses every CPU core** — multi-threaded compression (the only CPU-bound stage) scales across all cores automatically.
 - **Splits into volumes** — choose any volume size in MiB; great for size-limited storage, uploads, or transfer.
-- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No visible markers, just characters — and it can even be pasted **in the middle of other text** (a message, a signature) and still be found. Ideal for small (byte/kilobyte) secrets.
+- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No visible markers, just characters. Line wrapping, CRLF, and stray whitespace are tolerated, so paste it as its own block. Ideal for small (byte/kilobyte) secrets.
+- **Nothing identifying in the clear** — an archive begins with only its random salt and nonce; the magic, version, compression backend, and **folder name** all live *inside* the ciphertext. Without the password a blob is indistinguishable from random data — you cannot even tell it is a foldlock archive, and a wrong password is indistinguishable from "not ours."
 - **Tiny & self-contained** — a single ~1 MB binary, no runtime dependencies, optimized for size.
 - **Safe by default** — refuses to overwrite an existing folder; can prompt for the password without echoing it.
 
@@ -96,21 +97,23 @@ $ foldlock compress ./notes s3cret --armor
 Created ./notes.flk.txt
 ```
 
-The file is an opaque run of characters with **no markers or headers** — foldlock recognizes it purely from its structure:
+The file is an opaque run of characters with **no markers or headers** — no magic, no envelope, nothing that identifies it as foldlock. It is base64 of `salt ‖ nonce ‖ ciphertext`, so it looks like random base64:
 
 ```console
 $ cat notes.flk.txt
-RkxLMQIAmr8Vmb8SJagY2IwuLYKJ5XCW7CwTujMFAG5vdGVzBd1k/rtgQINjOK2Uz…
+h2kX8DnQjaTYdJAMv4uSHAdhxcXDV8pAGSUk2bQrlWd6Edgc8T2FEQUF3DI38aWgnFkLNEz…
 ```
 
-Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, stray whitespace, and even non‑ASCII junk like non‑breaking spaces are all tolerated — and the block may sit **in the middle of other text**, e.g. an email with a greeting and a signature), and decompress it by that name — foldlock finds the armored block and restores the original folder:
+Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, stray whitespace, and even non‑ASCII junk like non‑breaking spaces are all tolerated), and decompress it by that name — foldlock decodes the block and restores the original folder:
 
 ```console
 $ foldlock decompress ./one s3cret
 Extracted ./notes
 ```
 
-`--armor` is meant for **small data**: base64 adds ~33%, and clipboards/chats have limits — for large data, use binary volumes. Integrity is unchanged: the same authenticated encryption still detects any tampering or copy-paste corruption. If a file isn't a valid armored blob, foldlock falls back to the normal binary/volume path.
+Paste the blob as its **own block**. There are no frame delimiters, so base64-alphabet letters from surrounding prose (a greeting, a signature) would be read as part of the payload and corrupt it — keep other text on separate lines or in a separate message.
+
+`--armor` is meant for **small data**: base64 adds ~33%, and clipboards/chats have limits — for large data, use binary volumes. Integrity is unchanged: the same authenticated encryption still detects any tampering or copy-paste corruption. If a file isn't a valid armored blob (or the password is wrong), decompression fails cleanly.
 
 ### Decompress
 
@@ -205,7 +208,7 @@ decompress: .NNN volumes ─▶ join ─▶ decrypt + verify ─▶ decompress �
 
 With `--armor`, the final split stage is replaced by a base64 encoder that writes one text file; `decompress` sniffs the input and base64-decodes it back into the exact same byte stream before the usual join/decrypt/… path. Armor is a pure transport encoding — the encrypted bytes are identical either way.
 
-Each archive begins with a small plaintext header (magic, version, a random 16-byte salt, a random 7-byte nonce prefix, and the folder name). The header is fed as **additional authenticated data** to the first encryption block, so any tampering with it is detected.
+Each archive begins with an **opaque prefix** — just the random 16-byte salt and 7-byte nonce prefix, both indistinguishable from noise. Everything identifying (the `FLK1` magic, format version, compression backend, and folder name) is an **inner header encrypted as the first bytes of the stream**, so none of it appears in the clear. The salt and nonce need no additional-authenticated-data: tampering with the salt derives the wrong key, and tampering with the nonce fails the tag, so both are caught implicitly. Recognizing an archive therefore means *decrypting* it — a wrong password is indistinguishable from "not a foldlock archive," which is what keeps a stored blob deniable. (Legacy v1/v2 archives that carried a plaintext header are still read.)
 
 The compressed byte stream is encrypted as a sequence of 64 KiB AEAD blocks (the STREAM construction), then sliced into volumes of the requested size. Because each block carries its own authentication tag and a sequence counter, a corrupted, missing, reordered, or extra volume — or a wrong password — fails loudly instead of producing garbage.
 
@@ -216,7 +219,7 @@ The compressed byte stream is encrypted as a sequence of 64 KiB AEAD blocks (the
 | Key derivation | Argon2id (memory-hard) from password + random salt |
 | Encryption | ChaCha20-Poly1305 (AEAD), STREAM/`BE32` construction |
 | Per-block nonce | random 7-byte prefix ‖ 32-bit counter |
-| Integrity | Poly1305 tag per block; header bound as AAD |
+| Integrity | Poly1305 tag per block; header encrypted inside the stream |
 | Compression | zstd level 19 (default, multi-threaded); optional zstd-ultra or xz/LZMA |
 
 ## ⚠️ Security notes & limitations
