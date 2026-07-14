@@ -618,55 +618,114 @@ fn armor_corruption_is_rejected() {
     assert!(err.is_err(), "corrupted armored text must be rejected");
 }
 
-/// The headline case: the armored blob is pasted into the middle of an ordinary
-/// message — greeting and signature around it, and the blob itself reflowed
-/// across CRLF lines — yet foldlock finds and extracts it.
+/// The armored blob must carry no foldlock fingerprint: no frame delimiters, no
+/// plaintext magic, no leaked folder name, and no fixed "shoulders" shared by
+/// every blob. Without the password it is indistinguishable from random base64.
 #[test]
-fn armor_found_buried_in_an_email() {
+fn armored_blob_is_unmarked_and_hides_metadata() {
     let work = tempdir().unwrap();
-    let source = work.path().join("notes");
+    // A distinctive folder name that must NOT surface anywhere in the output.
+    let source = work.path().join("top_secret_dossier");
     fs::create_dir_all(&source).unwrap();
-    let expected = build_fixture(&source);
+    build_fixture(&source);
     let out_dir = work.path().join("out");
 
-    compress(&CompressOptions {
-        source: source.clone(),
-        password: "pw".to_string(),
-        volume_size: u64::MAX,
-        output_dir: out_dir.clone(),
-        algorithm: Algorithm::Zstd,
-        level: None,
-        armor: true,
-    })
-    .expect("armor compress failed");
+    let armor_once = |dir: &std::path::Path| -> Vec<u8> {
+        compress(&CompressOptions {
+            source: source.clone(),
+            password: "pw".to_string(),
+            volume_size: u64::MAX,
+            output_dir: dir.to_path_buf(),
+            algorithm: Algorithm::Zstd,
+            level: None,
+            armor: true,
+        })
+        .expect("armor compress failed");
+        fs::read(dir.join("top_secret_dossier.flk.txt")).unwrap()
+    };
 
-    let blob = fs::read_to_string(out_dir.join("notes.flk.txt")).unwrap();
-    // Wrap the blob across CRLF lines (breaks even fall inside the frame tokens).
-    let wrapped = blob
-        .as_bytes()
-        .chunks(48)
-        .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    // Bury it in a message with prose (full of base64-alphabet letters) around it.
-    let message = format!(
-        "Hi Bob,\r\n\r\nHere is the backup you asked for — paste the block below\r\n\
-         into foldlock to unpack it:\r\n\r\n{wrapped}\r\n\r\nThanks a lot!\r\nAlice\r\n"
+    let blob = armor_once(&out_dir);
+
+    // No legacy frame delimiters, and no base64 of the "FLK1" magic ("RkxLMQ"),
+    // which every old-format blob began with.
+    let text = String::from_utf8(blob.clone()).unwrap();
+    for marker in ["o3Qv9Xz1Lp7Rk2Bf", "e8Wn4Yc6Hs0Jd5Tg", "RkxLMQ"] {
+        assert!(!text.contains(marker), "blob leaks the marker {marker:?}");
+    }
+    // The decoded stream must NOT begin with the plaintext magic — it moved
+    // inside the ciphertext — and the folder name must not appear in the clear.
+    let decoded = base64_decode(&blob);
+    assert!(
+        !decoded.starts_with(b"FLK1"),
+        "magic must not be in the clear"
     );
-    let pasted = work.path().join("email.txt");
-    fs::write(&pasted, message).unwrap();
+    assert!(
+        !contains(&decoded, b"top_secret_dossier"),
+        "folder name must not leak in plaintext"
+    );
 
+    // A second run of the *same* source and password must share no fixed prefix:
+    // the random salt leads, so there are no constant shoulders to fingerprint.
+    let out_dir2 = work.path().join("out2");
+    let blob2 = armor_once(&out_dir2);
+    assert_ne!(blob, blob2, "two blobs must differ (random salt/nonce)");
+    let common = blob
+        .iter()
+        .zip(&blob2)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(
+        common < 8,
+        "blobs share a {common}-char prefix — looks like a fixed signature"
+    );
+
+    // And it still round-trips.
     let extract_dir = work.path().join("extract");
-    let result = decompress(&DecompressOptions {
-        archive: pasted,
+    decompress(&DecompressOptions {
+        archive: out_dir.join("top_secret_dossier.flk.txt"),
         password: "pw".to_string(),
         output_dir: extract_dir.clone(),
         force: false,
     })
-    .expect("payload must be found inside surrounding prose");
+    .expect("armor decompress failed");
+    assert!(extract_dir.join("top_secret_dossier").is_dir());
+}
 
-    assert_eq!(result.source, SourceKind::Armor);
-    assert_tree_matches(&extract_dir.join("notes"), &expected);
+/// True if `hay` contains the contiguous byte sequence `needle`.
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Minimal standard-alphabet base64 decoder for the tests, tolerant of `=`
+/// padding. Sufficient to inspect the decoded header of an armored blob.
+fn base64_decode(input: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [0xFFu8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let sextets: Vec<u8> = input
+        .iter()
+        .filter_map(|&b| (table[b as usize] != 0xFF).then_some(table[b as usize]))
+        .collect();
+    let mut out = Vec::with_capacity(sextets.len() / 4 * 3);
+    for quad in sextets.chunks(4) {
+        match quad {
+            [a, b, c, d] => {
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+                out.push((c << 6) | d);
+            }
+            [a, b, c] => {
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+            }
+            [a, b] => out.push((a << 2) | (b >> 4)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A plain text file that is not an archive must not be mistaken for armor; it
