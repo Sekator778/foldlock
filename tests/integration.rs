@@ -669,11 +669,7 @@ fn armored_blob_is_unmarked_and_hides_metadata() {
     let out_dir2 = work.path().join("out2");
     let blob2 = armor_once(&out_dir2);
     assert_ne!(blob, blob2, "two blobs must differ (random salt/nonce)");
-    let common = blob
-        .iter()
-        .zip(&blob2)
-        .take_while(|(a, b)| a == b)
-        .count();
+    let common = blob.iter().zip(&blob2).take_while(|(a, b)| a == b).count();
     assert!(
         common < 8,
         "blobs share a {common}-char prefix — looks like a fixed signature"
@@ -699,8 +695,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// Minimal standard-alphabet base64 decoder for the tests, tolerant of `=`
 /// padding. Sufficient to inspect the decoded header of an armored blob.
 fn base64_decode(input: &[u8]) -> Vec<u8> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [0xFFu8; 256];
     for (i, &c) in ALPHABET.iter().enumerate() {
         table[c as usize] = i as u8;
