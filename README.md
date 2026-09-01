@@ -9,10 +9,13 @@
 Think `tar | zstd | encrypt | split`, but a single ~1 MB self-contained binary with strong authenticated encryption and no shell pipelines to remember.
 
 ```console
-$ foldlock compress ./photos s3cret 100
+$ foldlock compress ./photos - 100
+Password: ********
+Confirm password: ********
 Created 11 volume(s)
 
-$ foldlock decompress ./photos.flk s3cret
+$ foldlock decompress ./photos.flk -
+Password: ********
 Extracted ./photos
 ```
 
@@ -23,7 +26,8 @@ Extracted ./photos
 - **Excellent compression** — zstd at level 19 by default, with optional zstd-ultra (`-l 22`) or xz/LZMA (`--max`) for maximum density.
 - **Uses every CPU core** — multi-threaded compression (the only CPU-bound stage) scales across all cores automatically.
 - **Splits into volumes** — choose any volume size in MiB; great for size-limited storage, uploads, or transfer.
-- **Copy-paste friendly** — `--armor` emits the whole archive as a single line of base64 text you can move through a clipboard, chat, or email; `decompress` detects it automatically. No visible markers, just characters — and it can even be pasted **in the middle of other text** (a message, a signature) and still be found. Ideal for small (byte/kilobyte) secrets.
+- **Text-safe transport** — `--armor` base64-encodes the whole archive into a single line of plain text, for channels that only carry text (clipboard, chat, email); `decompress` detects it automatically. Line wrapping, CRLF, and stray whitespace are tolerated, so paste it as its own block. Best for small (byte/kilobyte) payloads.
+- **Nothing identifying in the clear** — an archive begins with only its random salt and nonce; the magic, version, compression backend, and **folder name** all live *inside* the ciphertext. Without the password a blob is indistinguishable from random data — you cannot even tell it is a foldlock archive, and a wrong password is indistinguishable from "not ours."
 - **Tiny & self-contained** — a single ~1 MB binary, no runtime dependencies, optimized for size.
 - **Safe by default** — refuses to overwrite an existing folder; can prompt for the password without echoing it.
 
@@ -60,7 +64,7 @@ foldlock decompress <archive> [password]
 ### Compress
 
 ```sh
-foldlock compress ./photos s3cret 100   # 100 MiB volumes: photos.flk.001, .002, …
+foldlock compress ./photos - 100   # 100 MiB volumes: photos.flk.001, .002, … ('-' prompts for the password)
 ```
 
 - `<folder>`   – the directory (or file) to pack
@@ -74,9 +78,9 @@ Volumes are written to the current directory as `<folder>.flk.001`, `.002`, …
 By default foldlock uses **zstd level 19** — fast and a great ratio. For maximum density you can switch backends or raise the level:
 
 ```sh
-foldlock compress ./src s3cret 100 --max        # xz / LZMA: ~9% smaller, ~3x slower
-foldlock compress ./src s3cret 100 -l 22        # zstd ultra (wider window)
-foldlock compress ./src s3cret 100 --algo xz -l 6   # xz, custom level
+foldlock compress ./src - 100 --max        # xz / LZMA: ~9% smaller, ~3x slower
+foldlock compress ./src - 100 -l 22        # zstd ultra (wider window)
+foldlock compress ./src - 100 --algo xz -l 6   # xz, custom level
 ```
 
 - `-a, --algo <zstd|xz>` – backend (default `zstd`). `xz` is ~9% smaller on source
@@ -87,50 +91,65 @@ foldlock compress ./src s3cret 100 --algo xz -l 6   # xz, custom level
 
 The backend is recorded in the archive header, so **decompression detects it automatically** — no flag needed.
 
-#### Copy-paste (armored) archives
+#### Text-safe (armored) archives
 
-For small payloads — secrets, configs, keys, notes — you can emit the whole archive as a single continuous line of base64 text instead of binary volumes. `--armor` takes **no size argument** (the output is one file):
+Binary output doesn't survive plain-text channels: clipboards, chat apps, and email bodies can mangle, reject, or reformat raw bytes. `--armor` is a base64 text encoding for moving a small archive through exactly those channels. It writes the whole archive as a single continuous line of text instead of binary volumes, and takes **no size argument** (the output is always one file):
 
 ```console
-$ foldlock compress ./notes s3cret --armor
+$ foldlock compress ./notes - --armor
+Password: ********
+Confirm password: ********
 Created ./notes.flk.txt
 ```
 
-The file is an opaque run of characters with **no markers or headers** — foldlock recognizes it purely from its structure:
+The file is base64 of `salt ‖ nonce ‖ ciphertext` — plain text, safe to paste anywhere text is accepted:
 
 ```console
 $ cat notes.flk.txt
-RkxLMQIAmr8Vmb8SJagY2IwuLYKJ5XCW7CwTujMFAG5vdGVzBd1k/rtgQINjOK2Uz…
+h2kX8DnQjaTYdJAMv4uSHAdhxcXDV8pAGSUk2bQrlWd6Edgc8T2FEQUF3DI38aWgnFkLNEz…
 ```
 
-Copy those characters through a clipboard, chat, or email, paste them into **any file you like** (any name; line wrapping, CRLF, stray whitespace, and even non‑ASCII junk like non‑breaking spaces are all tolerated — and the block may sit **in the middle of other text**, e.g. an email with a greeting and a signature), and decompress it by that name — foldlock finds the armored block and restores the original folder:
+Copy those characters through a clipboard, chat, or email, paste them into a file (any name; line wrapping, CRLF, and stray whitespace are all tolerated), and decompress it by that name — `decompress` **auto-detects** the armored format, no flag needed:
 
 ```console
-$ foldlock decompress ./one s3cret
+$ foldlock decompress ./one -
+Password: ********
 Extracted ./notes
 ```
 
-`--armor` is meant for **small data**: base64 adds ~33%, and clipboards/chats have limits — for large data, use binary volumes. Integrity is unchanged: the same authenticated encryption still detects any tampering or copy-paste corruption. If a file isn't a valid armored blob, foldlock falls back to the normal binary/volume path.
+Paste the blob as its **own block, with nothing else in the file**. There are no frame delimiters, so any other base64-alphabet text sharing the file would be read as part of the payload and corrupt it.
+
+`--armor` is meant for **small data**: base64 adds ~33% overhead, and clipboards/chat apps/email have size limits — use binary volumes for anything larger. Integrity is unchanged: the same authenticated encryption still detects tampering or copy-paste corruption, and a bad password or malformed blob fails decompression cleanly.
 
 ### Decompress
 
 ```sh
-foldlock decompress ./photos.flk s3cret      # base name
-foldlock decompress ./photos.flk.001 s3cret  # …or any single volume
+foldlock decompress ./photos.flk -      # base name ('-' prompts for the password)
+foldlock decompress ./photos.flk.001 -  # …or any single volume
 ```
 
 The original folder name and the volume size are stored in the archive header, so **decompression only needs the archive and the password** — no size argument. The folder is recreated in the current directory. Pass `-f` / `--force` to overwrite an existing folder.
 
 ### Password handling
 
-A password typed on the command line is visible to other users (via the process list) and is saved in your shell history. For sensitive data, prefer one of:
+Pass `-` as the password to be prompted for it interactively, without echo. This is the form used throughout this README, and the one you should default to:
 
 ```sh
-foldlock compress ./photos - 100             # '-' → prompt, no echo (asked twice to confirm)
-FOLDLOCK_PASSWORD=s3cret foldlock compress ./photos - 100   # from the environment
+foldlock compress ./photos - 100    # prompts twice (to confirm) and doesn't echo
+foldlock decompress ./photos.flk -  # prompts once
 ```
 
-When a password is passed as an argument, foldlock prints a one-line warning to stderr. If your password itself starts with `-`, put it after a `--` separator so it isn't parsed as an option:
+Avoid putting the password directly on the command line (`foldlock compress ./photos s3cret 100`) — any other user on the machine can read it from the process list (`ps`), and your shell saves it in plaintext history. foldlock still accepts it that way for backward compatibility, but prints a one-line warning to stderr when it does.
+
+For scripts and other non-interactive callers, pipe the password in instead of typing it in argv:
+
+```sh
+echo "$PASSWORD" | foldlock compress ./photos - 100 --password-stdin
+```
+
+`--password-stdin` reads the password from stdin (trailing newline stripped) and pairs with `-` as the password argument. The `FOLDLOCK_PASSWORD` environment variable is also supported, and is checked when `-` is given without `--password-stdin`.
+
+If your password itself starts with `-`, put it after a `--` separator so it isn't parsed as an option:
 
 ```sh
 foldlock compress ./photos -- -my-password 100
@@ -155,10 +174,16 @@ foldlock compress ./project - 500 --max
 **Single-file archive** (huge volume size ⇒ everything in `.001`):
 
 ```sh
-foldlock compress ./project s3cret 1000000    # 1 TB cap → one volume
+foldlock compress ./project - 1000000    # 1 TB cap → one volume
 ```
 
-**Non-interactive backup from a script / cron** (password from the environment):
+**Non-interactive backup from a script / cron** (password piped in, no TTY):
+
+```sh
+foldlock compress /var/data/db - 250 --max --password-stdin < /etc/foldlock/db.pass
+```
+
+Or from the environment, if a secrets manager already exports it:
 
 ```sh
 export FOLDLOCK_PASSWORD='correct horse battery staple'
@@ -169,10 +194,10 @@ unset FOLDLOCK_PASSWORD
 **zstd ultra when you want more density but keep zstd’s fast decompression:**
 
 ```sh
-foldlock compress ./logs s3cret 100 -l 22
+foldlock compress ./logs - 100 -l 22
 ```
 
-**A small secret you can paste anywhere** (armored text, no markers):
+**A small secret as portable text** (armored, auto-detected on decompress):
 
 ```sh
 foldlock compress ./ssh-keys - --armor    # → ssh-keys.flk.txt (one line of base64)
@@ -185,7 +210,7 @@ foldlock decompress ./ssh-keys.flk.txt -   # auto-detected, prompts for the pass
 ```sh
 foldlock decompress ./photos.flk -             # base name, prompt for password
 foldlock decompress ./photos.flk.001 -         # …or point at any single volume
-foldlock decompress ./photos.flk s3cret -f     # overwrite an existing ./photos
+foldlock decompress ./photos.flk - -f          # overwrite an existing ./photos
 ```
 
 **Full round trip in one place:**
@@ -205,7 +230,7 @@ decompress: .NNN volumes ─▶ join ─▶ decrypt + verify ─▶ decompress �
 
 With `--armor`, the final split stage is replaced by a base64 encoder that writes one text file; `decompress` sniffs the input and base64-decodes it back into the exact same byte stream before the usual join/decrypt/… path. Armor is a pure transport encoding — the encrypted bytes are identical either way.
 
-Each archive begins with a small plaintext header (magic, version, a random 16-byte salt, a random 7-byte nonce prefix, and the folder name). The header is fed as **additional authenticated data** to the first encryption block, so any tampering with it is detected.
+Each archive begins with an **opaque prefix** — just the random 16-byte salt and 7-byte nonce prefix, both indistinguishable from noise. Everything identifying (the `FLK1` magic, format version, compression backend, and folder name) is an **inner header encrypted as the first bytes of the stream**, so none of it appears in the clear. The salt and nonce need no additional-authenticated-data: tampering with the salt derives the wrong key, and tampering with the nonce fails the tag, so both are caught implicitly. Recognizing an archive therefore means *decrypting* it — a wrong password is indistinguishable from "not a foldlock archive," which is what keeps a stored blob deniable. (Legacy v1/v2 archives that carried a plaintext header are still read.)
 
 The compressed byte stream is encrypted as a sequence of 64 KiB AEAD blocks (the STREAM construction), then sliced into volumes of the requested size. Because each block carries its own authentication tag and a sequence counter, a corrupted, missing, reordered, or extra volume — or a wrong password — fails loudly instead of producing garbage.
 
@@ -216,7 +241,7 @@ The compressed byte stream is encrypted as a sequence of 64 KiB AEAD blocks (the
 | Key derivation | Argon2id (memory-hard) from password + random salt |
 | Encryption | ChaCha20-Poly1305 (AEAD), STREAM/`BE32` construction |
 | Per-block nonce | random 7-byte prefix ‖ 32-bit counter |
-| Integrity | Poly1305 tag per block; header bound as AAD |
+| Integrity | Poly1305 tag per block; header encrypted inside the stream |
 | Compression | zstd level 19 (default, multi-threaded); optional zstd-ultra or xz/LZMA |
 
 ## ⚠️ Security notes & limitations

@@ -1,6 +1,7 @@
 //! `foldlock` command-line interface.
 
 use std::env;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -32,10 +33,12 @@ COMMANDS:
                  archive, so no size argument is needed.
 
 PASSWORD:
-    Pass the password as an argument, or use '-' to be prompted without echo.
-    The FOLDLOCK_PASSWORD environment variable is used when no argument (or '-')
-    is given. Note: a password on the command line is visible to other users via
-    the process list and your shell history — prefer '-' or the env var.
+    Use '-' as the password to be prompted without echo — this is the
+    recommended form. A password given directly as an argument is visible to
+    other users on the machine via the process list and is saved in your
+    shell history; foldlock prints a warning to stderr when this happens.
+    For scripts, prefer --password-stdin or the FOLDLOCK_PASSWORD environment
+    variable over putting the password in argv.
 
 OPTIONS:
     -a, --algo <zstd|xz>   Compression backend (compress only). Default: zstd —
@@ -48,6 +51,10 @@ OPTIONS:
         --armor            Write a single copy-pasteable base64 text file instead
                            of binary volumes (compress only; takes no size arg).
                            decompress detects an armored file automatically.
+        --password-stdin   Read the password from stdin (trailing newline
+                           stripped) instead of prompting. Use '-' as the
+                           password argument alongside this flag. This is the
+                           way to script foldlock without an interactive TTY.
     -f, --force            Overwrite the destination folder if it already exists
                            (decompress only).
     -h, --help             Print this help.
@@ -57,14 +64,16 @@ The compression backend is recorded in the archive, so decompress needs no
 algorithm flag — it is detected automatically.
 
 EXAMPLES:
-    foldlock compress ./photos s3cret 100          # 100 MiB volumes, zstd
-    foldlock compress ./photos - 100 --max         # maximum density (xz)
-    foldlock compress ./src s3cret 100 -l 22       # zstd ultra
-    foldlock compress ./photos - 100               # prompt for the password
-    foldlock compress ./notes s3cret --armor       # one base64 text blob to paste
-    foldlock decompress ./photos.flk s3cret
-    foldlock decompress ./photos.flk.001 -         # prompt for the password
-    foldlock decompress ./notes.flk.txt s3cret     # armored file, auto-detected
+    foldlock compress ./photos - 100                     # prompt for the password
+    foldlock compress ./src - 100 --max                  # maximum density (xz)
+    foldlock compress ./src - 100 -l 22                  # zstd ultra
+    foldlock compress ./notes - --armor                  # one base64 text blob to paste
+    foldlock decompress ./photos.flk -
+    foldlock decompress ./photos.flk.001 -               # prompt for the password
+    foldlock decompress ./notes.flk.txt -                # armored file, auto-detected
+
+    # scripted, no TTY:
+    echo \"$PASSWORD\" | foldlock compress ./data - 100 --password-stdin
 ";
 
 fn main() -> ExitCode {
@@ -104,6 +113,7 @@ fn run() -> Result<()> {
     // value (even one that looks like a flag) can follow it positionally.
     let mut force = false;
     let mut armor = false;
+    let mut password_stdin = false;
     let mut algo: Option<String> = None;
     let mut level: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -121,6 +131,7 @@ fn run() -> Result<()> {
             "--" => options_done = true,
             "-f" | "--force" => force = true,
             "--armor" => armor = true,
+            "--password-stdin" => password_stdin = true,
             "--max" => algo = Some("xz".to_string()),
             "-a" | "--algo" => {
                 i += 1;
@@ -165,13 +176,19 @@ fn run() -> Result<()> {
             if force {
                 bail!("--force is only valid for 'decompress'");
             }
-            run_compress(&positionals, algo.as_deref(), level.as_deref(), armor)
+            run_compress(
+                &positionals,
+                algo.as_deref(),
+                level.as_deref(),
+                armor,
+                password_stdin,
+            )
         }
         "decompress" => {
             if algo.is_some() || level.is_some() || armor {
                 bail!("--algo/--level/--armor are only valid for 'compress'");
             }
-            run_decompress(&positionals, force)
+            run_decompress(&positionals, force, password_stdin)
         }
         other => bail!("unknown command '{other}' (try 'foldlock --help')"),
     }
@@ -182,6 +199,7 @@ fn run_compress(
     algo: Option<&str>,
     level: Option<&str>,
     armor: bool,
+    password_stdin: bool,
 ) -> Result<()> {
     // Armor writes a single text file, so it takes no volume-size argument.
     let (folder, password_arg, size_arg) = if armor {
@@ -201,7 +219,7 @@ fn run_compress(
     if !source.exists() {
         bail!("source '{}' does not exist", source.display());
     }
-    let password = resolve_password(Some(password_arg), true)?;
+    let password = resolve_password(Some(password_arg), true, password_stdin)?;
     let volume_size = match size_arg {
         Some(s) => {
             let size_mib: u64 = s
@@ -255,12 +273,16 @@ fn run_compress(
     Ok(())
 }
 
-fn run_decompress(positionals: &[String], force: bool) -> Result<()> {
+fn run_decompress(positionals: &[String], force: bool, password_stdin: bool) -> Result<()> {
     if positionals.is_empty() || positionals.len() > 2 {
         bail!("decompress expects: <archive> [password] (try 'foldlock --help')");
     }
     let archive = PathBuf::from(&positionals[0]);
-    let password = resolve_password(positionals.get(1).map(String::as_str), false)?;
+    let password = resolve_password(
+        positionals.get(1).map(String::as_str),
+        false,
+        password_stdin,
+    )?;
 
     let opts = DecompressOptions {
         archive,
@@ -273,16 +295,31 @@ fn run_decompress(positionals: &[String], force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the password from the argument, the environment, or a TTY prompt.
-/// `confirm` asks twice when prompting interactively (used for compression).
-fn resolve_password(arg: Option<&str>, confirm: bool) -> Result<String> {
+/// Resolve the password from the argument, stdin, the environment, or a TTY
+/// prompt. `confirm` asks twice when prompting interactively (compression
+/// only); it is skipped for stdin, which is read once and not interactive.
+fn resolve_password(arg: Option<&str>, confirm: bool, from_stdin: bool) -> Result<String> {
     if let Some(pw) = arg {
         if pw != "-" {
+            if from_stdin {
+                bail!(
+                    "--password-stdin conflicts with a password given as an argument; \
+                     pass '-' as the password to read it from stdin"
+                );
+            }
             if pw.is_empty() {
                 bail!("password must not be empty");
             }
+            eprintln!(
+                "warning: passing the password as an argument exposes it via the process \
+                 list and shell history; prefer '-' with --password-stdin, a TTY prompt, or \
+                 FOLDLOCK_PASSWORD."
+            );
             return Ok(pw.to_string());
         }
+    }
+    if from_stdin {
+        return read_password_from_stdin();
     }
     if let Ok(pw) = env::var("FOLDLOCK_PASSWORD") {
         if !pw.is_empty() {
@@ -301,6 +338,21 @@ fn resolve_password(arg: Option<&str>, confirm: bool) -> Result<String> {
         }
     }
     Ok(password)
+}
+
+/// Read a password piped into stdin (e.g. `echo "$PASS" | foldlock ...
+/// --password-stdin`), stripping a trailing newline (and CR, for CRLF).
+fn read_password_from_stdin() -> Result<String> {
+    let mut buf = String::new();
+    io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read password from stdin")?;
+    let trimmed_len = buf.trim_end_matches(['\n', '\r']).len();
+    buf.truncate(trimmed_len);
+    if buf.is_empty() {
+        bail!("password must not be empty");
+    }
+    Ok(buf)
 }
 
 /// Print a single concise confirmation line — the output location and nothing

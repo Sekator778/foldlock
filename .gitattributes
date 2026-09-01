@@ -1,0 +1,10 @@
+# Normalize line endings: store everything as LF in the repo and check out LF
+# on every platform, so an editor with CRLF conversion can't dirty the tree.
+* text=auto eol=lf
+
+# Explicit for good measure.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.lock text eol=lf
