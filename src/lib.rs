@@ -7,18 +7,24 @@
 //! On-disk layout of the logical stream (before volume splitting):
 //!
 //! ```text
-//! ┌──────────────── plaintext header ────────────────┐┌── AEAD ciphertext ──┐
-//! │ "FLK1" │ ver │ algo │ salt[16] │ nprefix[7]       ││ block₀ │ … │ blockₙ │
-//! │ name_len(u16-le) │ name[name_len]                 ││ (ciphertext ‖ tag)  │
-//! └───────────────────────────────────────────────────┘└─────────────────────┘
+//! ┌─ opaque prefix ─┐┌──────────── AEAD ciphertext ────────────┐
+//! │ salt[16] nonc[7]││ enc( inner header ‖ compressed tar )     │
+//! └─────────────────┘└─────────────────────────────────────────┘
+//!
+//! inner header (encrypted): "FLK1" │ ver │ algo │ name_len(u16-le) │ name
 //! ```
 //!
-//! `algo` selects the compression backend (zstd or xz) and is present from
-//! header version 2 onward; version-1 archives have no `algo` byte and are
-//! always zstd.
+//! Only the random salt and nonce prefix are in the clear; the magic, version,
+//! compression `algo`, and folder `name` all live *inside* the ciphertext, so a
+//! stored blob is byte-for-byte indistinguishable from random data without the
+//! password — and it cannot even be identified as a foldlock archive. `algo`
+//! selects the compression backend (zstd or xz). Salt and nonce need no AEAD
+//! additional-data: tampering with the salt derives the wrong key and tampering
+//! with the nonce fails the tag, so both are caught implicitly.
 //!
-//! The full header is fed as AEAD additional-authenticated-data to the first
-//! block, so tampering with the salt, nonce, or stored name is detected.
+//! Legacy v1/v2 archives — which carried a *plaintext* `FLK1` header — are still
+//! read (detected by that leading magic); new archives are only ever written in
+//! the current format.
 
 mod armor;
 mod codec;
@@ -44,12 +50,24 @@ use codec::{CompressWriter, DecompressReader};
 /// is assumed to be binary and streamed rather than read into memory.
 const ARMOR_READ_CAP: u64 = 64 * 1024 * 1024;
 
+/// Smallest a base64-decoded blob can be and still be plausibly an archive
+/// (salt + nonce + a non-empty AEAD block). Shorter decodes are unrelated text
+/// that merely happened to contain base64 letters, so they are not treated as
+/// armor. Kept safely below the true minimum (~70 bytes) to never reject a real
+/// archive; anything above it that is *not* ours simply fails to decrypt later.
+const MIN_ARMOR_BYTES: usize = 40;
+
 /// File extension marking a foldlock volume set: `<folder>.flk.NNN`.
 const ARCHIVE_EXT: &str = "flk";
 const MAGIC: &[u8; 4] = b"FLK1";
-/// Header format version. v1 (zstd only, no algorithm byte) is still readable;
-/// v2 adds a one-byte compression-algorithm selector after the version.
-const FORMAT_VERSION: u8 = 2;
+/// Inner-header format version, written *inside* the ciphertext. Legacy plaintext
+/// headers used v1 (zstd only, no algorithm byte) and v2 (adds an algorithm
+/// byte); both are still readable via the legacy path. v3 is the current format,
+/// where the whole header moved inside the AEAD.
+const FORMAT_VERSION: u8 = 3;
+/// Legacy plaintext-header versions, recognized by a leading [`MAGIC`].
+const LEGACY_VERSION_ZSTD: u8 = 1;
+const LEGACY_VERSION_ALGO: u8 = 2;
 /// Upper bound on the stored folder name, to reject corrupt headers cheaply.
 const MAX_NAME_LEN: usize = 4096;
 
@@ -142,13 +160,15 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
     let base_name = format!("{root_name}.{ARCHIVE_EXT}");
     let base_path = opts.output_dir.join(&base_name);
 
-    // Random salt + nonce prefix.
+    // Random salt + nonce prefix — the only bytes ever written in the clear.
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
     getrandom::getrandom(&mut salt).map_err(|e| anyhow!("RNG failure: {e}"))?;
     getrandom::getrandom(&mut nonce_prefix).map_err(|e| anyhow!("RNG failure: {e}"))?;
 
-    let header = build_header(opts.algorithm, &salt, &nonce_prefix, &root_name)?;
+    // The identifying header (magic, version, algorithm, folder name) is encrypted
+    // below rather than written in the clear, so it leaks nothing.
+    let inner_header = build_inner_header(opts.algorithm, &root_name)?;
     let key = derive_key(&opts.password, &salt)?;
 
     // Pre-collect entries before any volume is written, so that when we pack the
@@ -175,11 +195,14 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
         let armor_path = opts.output_dir.join(format!("{base_name}.txt"));
         let file = File::create(&armor_path)
             .with_context(|| format!("cannot create '{}'", armor_path.display()))?;
-        Sink::Armor(ArmorWriter::new(BufWriter::new(file))?, armor_path)
+        Sink::Armor(ArmorWriter::new(BufWriter::new(file)), armor_path)
     } else {
         Sink::Volumes(VolumeWriter::new(base_path, opts.volume_size))
     };
-    sink.write_all(&header)
+    // Opaque prefix: salt || nonce, indistinguishable from random data.
+    sink.write_all(&salt)
+        .context("failed to write archive header")?;
+    sink.write_all(&nonce_prefix)
         .context("failed to write archive header")?;
 
     // Use every available core for the CPU-bound compression stage (zstd only;
@@ -193,7 +216,12 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
             .unwrap_or(1)
     };
 
-    let encryptor = EncryptingWriter::new(sink, &key, &nonce_prefix, header);
+    // No AAD: the inner header is encrypted as the first plaintext written to the
+    // stream, so it is authenticated as ciphertext rather than as additional data.
+    let mut encryptor = EncryptingWriter::new(sink, &key, &nonce_prefix, Vec::new());
+    encryptor
+        .write_all(&inner_header)
+        .context("failed to write archive header")?;
     let comp = CompressWriter::new(encryptor, opts.algorithm, opts.level, threads)
         .context("failed to start compressor")?;
 
@@ -242,59 +270,24 @@ pub fn compress(opts: &CompressOptions) -> Result<CompressSummary> {
 
 /// Reassemble, decrypt, decompress, and extract a volume set.
 pub fn decompress(opts: &DecompressOptions) -> Result<DecompressSummary> {
-    // Sniff the input: an armored (base64) text blob, a standalone binary file,
-    // or a split-volume set. Armored text is tried first; anything unrecognized
-    // falls back to the original binary/volume path.
+    // Obtain the raw archive byte stream — an armored (base64) blob, a standalone
+    // binary file, or a joined split-volume set.
     let (mut source, source_kind) = open_source(&opts.archive)?;
 
-    // Read and validate the plaintext header, accumulating the exact bytes so
-    // they can be replayed as the AEAD additional-authenticated-data.
-    let mut header: Vec<u8> = Vec::with_capacity(64);
-
-    let mut magic_ver = [0u8; 5];
+    // The current format opens with an opaque salt|nonce prefix; a legacy archive
+    // opens with the plaintext "FLK1" magic. Peek the first four bytes to tell
+    // them apart, then recover the folder name, compression algorithm, and a
+    // decryptor positioned at the (encrypted) tar stream.
+    let mut prefix = [0u8; 4];
     source
-        .read_exact(&mut magic_ver)
+        .read_exact(&mut prefix)
         .context("archive is truncated (header)")?;
-    if &magic_ver[0..4] != MAGIC {
-        bail!("not a foldlock archive (bad magic)");
-    }
-    header.extend_from_slice(&magic_ver);
 
-    // Version gates the layout: v1 has no algorithm byte (always zstd); v2+
-    // stores the compression backend in one byte right after the version.
-    let algorithm = match magic_ver[4] {
-        1 => Algorithm::Zstd,
-        2 => {
-            let mut algo = [0u8; 1];
-            source
-                .read_exact(&mut algo)
-                .context("archive is truncated (header)")?;
-            header.extend_from_slice(&algo);
-            Algorithm::from_byte(algo[0])?
-        }
-        v => bail!("unsupported archive version {v}"),
+    let (root_name, algorithm, decryptor) = if &prefix == MAGIC {
+        read_legacy_header(source, &opts.password)?
+    } else {
+        read_current_header(source, prefix, &opts.password)?
     };
-
-    let mut rest = [0u8; SALT_LEN + NONCE_PREFIX_LEN + 2];
-    source
-        .read_exact(&mut rest)
-        .context("archive is truncated (header)")?;
-    let salt: [u8; SALT_LEN] = rest[..SALT_LEN].try_into().unwrap();
-    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = rest[SALT_LEN..SALT_LEN + NONCE_PREFIX_LEN]
-        .try_into()
-        .unwrap();
-    let name_len = u16::from_le_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]) as usize;
-    header.extend_from_slice(&rest);
-    if name_len == 0 || name_len > MAX_NAME_LEN {
-        bail!("corrupt header (name length {name_len})");
-    }
-
-    let mut name_bytes = vec![0u8; name_len];
-    source
-        .read_exact(&mut name_bytes)
-        .context("archive is truncated (name)")?;
-    let root_name = String::from_utf8(name_bytes.clone()).context("corrupt header (name)")?;
-    header.extend_from_slice(&name_bytes);
 
     std::fs::create_dir_all(&opts.output_dir)
         .with_context(|| format!("cannot create output dir '{}'", opts.output_dir.display()))?;
@@ -306,8 +299,6 @@ pub fn decompress(opts: &DecompressOptions) -> Result<DecompressSummary> {
         );
     }
 
-    let key = derive_key(&opts.password, &salt)?;
-    let decryptor = DecryptingReader::new(source, &key, &nonce_prefix, header);
     let decomp =
         DecompressReader::new(decryptor, algorithm).context("failed to start decompressor")?;
     let mut archive = tar::Archive::new(decomp);
@@ -358,28 +349,143 @@ fn remove_path(path: &Path) -> Result<()> {
     .with_context(|| format!("cannot remove '{}'", path.display()))
 }
 
-/// Build the plaintext header: magic, version, algorithm, salt, nonce prefix,
-/// and name.
-fn build_header(
-    algorithm: Algorithm,
-    salt: &[u8; SALT_LEN],
-    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
-    name: &str,
-) -> Result<Vec<u8>> {
+/// Build the inner header — magic, version, algorithm, and name — that is
+/// written *inside* the ciphertext (the salt and nonce prefix stay outside, in
+/// the clear, and so are not part of it).
+fn build_inner_header(algorithm: Algorithm, name: &str) -> Result<Vec<u8>> {
     let name_bytes = name.as_bytes();
     if name_bytes.len() > MAX_NAME_LEN {
         bail!("folder name too long ({} bytes)", name_bytes.len());
     }
-    let mut header =
-        Vec::with_capacity(4 + 1 + 1 + SALT_LEN + NONCE_PREFIX_LEN + 2 + name_bytes.len());
+    let mut header = Vec::with_capacity(4 + 1 + 1 + 2 + name_bytes.len());
     header.extend_from_slice(MAGIC);
     header.push(FORMAT_VERSION);
     header.push(algorithm.to_byte());
-    header.extend_from_slice(salt);
-    header.extend_from_slice(nonce_prefix);
     header.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
     header.extend_from_slice(name_bytes);
     Ok(header)
+}
+
+/// Read a legacy (v1/v2) *plaintext* header. The leading magic has already been
+/// consumed from `source`; the exact header bytes are re-accumulated so they can
+/// be replayed as the AEAD additional-authenticated-data the way these archives
+/// were written. Returns the folder name, algorithm, and a decryptor positioned
+/// at the ciphertext.
+fn read_legacy_header(
+    mut source: Source,
+    password: &str,
+) -> Result<(String, Algorithm, DecryptingReader<Source>)> {
+    let mut header: Vec<u8> = Vec::with_capacity(64);
+    header.extend_from_slice(MAGIC);
+
+    let mut ver = [0u8; 1];
+    source
+        .read_exact(&mut ver)
+        .context("archive is truncated (header)")?;
+    header.extend_from_slice(&ver);
+
+    // v1 has no algorithm byte (always zstd); v2 stores the backend right after
+    // the version.
+    let algorithm = match ver[0] {
+        LEGACY_VERSION_ZSTD => Algorithm::Zstd,
+        LEGACY_VERSION_ALGO => {
+            let mut algo = [0u8; 1];
+            source
+                .read_exact(&mut algo)
+                .context("archive is truncated (header)")?;
+            header.extend_from_slice(&algo);
+            Algorithm::from_byte(algo[0])?
+        }
+        v => bail!("unsupported archive version {v}"),
+    };
+
+    let mut rest = [0u8; SALT_LEN + NONCE_PREFIX_LEN + 2];
+    source
+        .read_exact(&mut rest)
+        .context("archive is truncated (header)")?;
+    let salt: [u8; SALT_LEN] = rest[..SALT_LEN].try_into().unwrap();
+    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = rest[SALT_LEN..SALT_LEN + NONCE_PREFIX_LEN]
+        .try_into()
+        .unwrap();
+    let name_len = u16::from_le_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]) as usize;
+    header.extend_from_slice(&rest);
+    if name_len == 0 || name_len > MAX_NAME_LEN {
+        bail!("corrupt header (name length {name_len})");
+    }
+
+    let mut name_bytes = vec![0u8; name_len];
+    source
+        .read_exact(&mut name_bytes)
+        .context("archive is truncated (name)")?;
+    let root_name = String::from_utf8(name_bytes.clone()).context("corrupt header (name)")?;
+    header.extend_from_slice(&name_bytes);
+
+    let key = derive_key(password, &salt)?;
+    let decryptor = DecryptingReader::new(source, &key, &nonce_prefix, header);
+    Ok((root_name, algorithm, decryptor))
+}
+
+/// Read the current-format header. The opaque prefix is `salt || nonce`; its
+/// first four bytes are already consumed and passed in as `prefix`. The rest of
+/// the prefix is read in the clear, then the magic, version, algorithm, and name
+/// are recovered from *inside* the ciphertext.
+///
+/// A wrong password makes the AEAD tag fail while reading the inner magic, which
+/// is deliberately indistinguishable from "not a foldlock archive" — without the
+/// password there is nothing that identifies the blob as ours.
+fn read_current_header(
+    mut source: Source,
+    prefix: [u8; 4],
+    password: &str,
+) -> Result<(String, Algorithm, DecryptingReader<Source>)> {
+    // Finish reading the opaque prefix: salt (16) + nonce prefix (7), of which
+    // the first four salt bytes are already in `prefix`.
+    let mut tail = [0u8; SALT_LEN + NONCE_PREFIX_LEN - 4];
+    source
+        .read_exact(&mut tail)
+        .context("archive is truncated (header)")?;
+    let mut salt = [0u8; SALT_LEN];
+    salt[..4].copy_from_slice(&prefix);
+    salt[4..].copy_from_slice(&tail[..SALT_LEN - 4]);
+    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = tail[SALT_LEN - 4..].try_into().unwrap();
+
+    let key = derive_key(password, &salt)?;
+    // No AAD: the header is encrypted plaintext, authenticated as ciphertext.
+    let mut decryptor = DecryptingReader::new(source, &key, &nonce_prefix, Vec::new());
+
+    let bad = || anyhow!("wrong password, or not a foldlock archive");
+    let mut magic = [0u8; MAGIC.len()];
+    decryptor.read_exact(&mut magic).map_err(|_| bad())?;
+    if &magic != MAGIC {
+        return Err(bad());
+    }
+
+    let mut ver = [0u8; 1];
+    decryptor.read_exact(&mut ver).context("corrupt header")?;
+    if ver[0] != FORMAT_VERSION {
+        bail!("unsupported archive version {}", ver[0]);
+    }
+
+    let mut algo = [0u8; 1];
+    decryptor.read_exact(&mut algo).context("corrupt header")?;
+    let algorithm = Algorithm::from_byte(algo[0])?;
+
+    let mut name_len_bytes = [0u8; 2];
+    decryptor
+        .read_exact(&mut name_len_bytes)
+        .context("corrupt header")?;
+    let name_len = u16::from_le_bytes(name_len_bytes) as usize;
+    if name_len == 0 || name_len > MAX_NAME_LEN {
+        bail!("corrupt header (name length {name_len})");
+    }
+
+    let mut name_bytes = vec![0u8; name_len];
+    decryptor
+        .read_exact(&mut name_bytes)
+        .context("corrupt header (name)")?;
+    let root_name = String::from_utf8(name_bytes).context("corrupt header (name)")?;
+
+    Ok((root_name, algorithm, decryptor))
 }
 
 /// True if `path` is one of our own output files living directly in
@@ -466,37 +572,45 @@ impl Read for Source {
 
 /// Classify `archive` and open the right source.
 ///
-/// Precedence: a single existing file is inspected by content — the binary
-/// magic wins immediately, otherwise a small file is tried as an armored base64
-/// blob. Anything not recognized (including a bare base name whose only real
-/// files are `.NNN` volumes) falls through to the volume opener.
+/// Precedence for a single existing file: a numbered `.NNN` volume is joined by
+/// name (the current format has no content magic to key off); otherwise a legacy
+/// plaintext-magic file streams directly; otherwise a small file is tried as an
+/// armored base64 blob. Whether an armored blob is genuinely ours is settled
+/// later by decryption, so the length gate here only skips obviously-too-short
+/// text. Anything unrecognized (including a bare base name whose only real files
+/// are `.NNN` volumes) falls through to the volume opener.
 fn open_source(archive: &Path) -> Result<(Source, SourceKind)> {
     if archive.is_file() {
+        // A numbered volume is recognized by its name and handed to the volume
+        // opener to join the whole set — regardless of its (now unmarked) content.
+        if has_digit_extension(archive) {
+            let reader = VolumeReader::open(archive)?;
+            let count = reader.volume_count();
+            return Ok((Source::Volumes(reader), SourceKind::Volumes(count)));
+        }
+
+        // A legacy archive still carries the plaintext magic; stream it directly.
         let mut file =
             File::open(archive).with_context(|| format!("cannot open '{}'", archive.display()))?;
         let mut magic = [0u8; MAGIC.len()];
         let n = read_fully(&mut file, &mut magic)?;
         if n == MAGIC.len() && &magic == MAGIC {
-            // A binary archive stream. A numbered volume hands off to the volume
-            // opener (to join the whole set); a standalone file streams directly.
-            if has_digit_extension(archive) {
-                let reader = VolumeReader::open(archive)?;
-                let count = reader.volume_count();
-                return Ok((Source::Volumes(reader), SourceKind::Volumes(count)));
-            }
             let file = File::open(archive)?;
             return Ok((
                 Source::SingleFile(BufReader::new(file)),
                 SourceKind::SingleFile,
             ));
         }
-        // Not the binary magic — try to read it as an armored (base64) blob.
+
+        // Otherwise try to read it as an armored (base64) blob.
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if len <= ARMOR_READ_CAP {
             let data = std::fs::read(archive)
                 .with_context(|| format!("cannot read '{}'", archive.display()))?;
-            if let Some(bytes) = armor::decode(&data, MAGIC)? {
-                return Ok((Source::Armor(Cursor::new(bytes)), SourceKind::Armor));
+            if let Some(bytes) = armor::decode(&data) {
+                if bytes.len() >= MIN_ARMOR_BYTES {
+                    return Ok((Source::Armor(Cursor::new(bytes)), SourceKind::Armor));
+                }
             }
         }
     }
